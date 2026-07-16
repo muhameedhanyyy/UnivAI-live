@@ -1,0 +1,14 @@
+torch==2.3.1
+torchaudio==2.3.1
+torchvision==0.18.1
+faster-whisper==1.1.1
+ctranslate2==4.5.0
+sounddevice
+numpy
+scipy
+soundfile
+webrtcvad
+silero-vad
+librosa
+pyyaml
+tqdm
