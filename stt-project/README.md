@@ -1,6 +1,9 @@
-# STT test project
+# STT and XTTS test project
 
-This folder contains a local microphone-to-transcript demo for testing Faster Whisper with Silero VAD on Ubuntu.
+This folder contains a local prototype for testing:
+
+- Speech-to-text with Faster Whisper + Silero VAD
+- Text-to-speech with XTTS v2
 
 ## Requirements
 
@@ -12,11 +15,11 @@ This folder contains a local microphone-to-transcript demo for testing Faster Wh
 ## Setup
 
 ```bash
-cd /home/mo/xtts-stream/stt-project
+cd /home/mo/xtts-stream/UnivAI-live/stt-project
 python3.11 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip setuptools wheel
-pip install torch==2.3.1 torchaudio==2.3.1 torchvision==0.18.1 faster-whisper==1.1.1 ctranslate2==4.5.0 sounddevice numpy scipy soundfile webrtcvad silero-vad librosa pyyaml tqdm
+pip install -r requirements.txt
 ```
 
 ## Run file transcription
@@ -31,7 +34,19 @@ python transcribe_file.py
 python live_transcribe.py
 ```
 
+## Run XTTS demo
+
+```bash
+python tts_demo.py
+```
+
+## Run the voice-chat prototype
+
+```bash
+python voice_chat.py
+```
+
 ## Notes
 
-- The model will be cached under the models folder.
-- The live transcription loop is intentionally simple and can be connected later to XTTS or a WebSocket API.
+- The Whisper model cache will be stored under the models folder.
+- The voice-chat loop is intentionally simple and can be connected later to a larger tutor flow.
