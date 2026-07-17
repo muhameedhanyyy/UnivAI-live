@@ -42,9 +42,9 @@ TTS_ENGINE = os.getenv("TTS_ENGINE", "kokoro").lower()
 TTS_LIVE_ENGINE = os.getenv("TTS_LIVE_ENGINE", "").lower()
 LATENCY_GATE_S = float(os.getenv("TTS_LATENCY_GATE_S", "4.0"))
 
-PIPER_MODEL = os.getenv("PIPER_MODEL", "models/piper/en_US-lessac-medium.onnx")
-KOKORO_MODEL = os.getenv("KOKORO_MODEL", "models/kokoro/kokoro-v1.0.onnx")
-KOKORO_VOICES = os.getenv("KOKORO_VOICES", "models/kokoro/voices-v1.0.bin")
+PIPER_MODEL = os.getenv("PIPER_MODEL", "UnivAI-live/models/piper/en_US-lessac-medium.onnx")
+KOKORO_MODEL = os.getenv("KOKORO_MODEL", "UnivAI-live/models/kokoro/kokoro-v1.0.onnx")
+KOKORO_VOICES = os.getenv("KOKORO_VOICES", "UnivAI-live/models/kokoro/voices-v1.0.bin")
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
 
 

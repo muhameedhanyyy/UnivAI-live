@@ -21,6 +21,7 @@ default) and waits for lecture rooms. Logs land in the campus `logs/`.
 | `qa.py` | a raised-hand question → RAG (the Brain, over MCP) → short spoken answer with page citations |
 | `tts.py` | the voices: Kokoro (rich, used for pre-rendering) and Piper (~10x realtime, used live) |
 | `prerender_audio.py` | records the whole lecture + the personalized raise-hand prompts to disk, so lectures start instantly |
+| `models/` | the voice model binaries (Kokoro, Piper) — gitignored, fetched by `make models` from the campus root |
 | `stt-project/` | speech-to-text / XTTS research prototypes |
 
 ## How it connects

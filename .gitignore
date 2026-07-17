@@ -1,5 +1,7 @@
 venv/
 .venv/
+# voice model binaries — downloaded by `make models` from the campus root
+models/
 __pycache__/
 *.py[cod]
 *.pyo
