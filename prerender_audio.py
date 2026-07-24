@@ -35,13 +35,16 @@ LECTURES_DIR = ROOT / "lectures"
 PROMPTS_DIR = LECTURES_DIR / "_prompts"
 
 
-def prerender_all(log=print) -> dict:
+def prerender_all(sid: str | None = None, log=print) -> dict:
     from tts import load_engine  # imports onnx models — keep at call time
 
     engine = load_engine()
     rendered = 0
 
-    for folder in sorted(LECTURES_DIR.glob("week-*")):
+    # Multi-tenant: render this student's course under lectures/<sid>/week-N/.
+    # Without a sid, fall back to the legacy global lectures/week-N/.
+    base = LECTURES_DIR / sid if sid else LECTURES_DIR
+    for folder in sorted(base.glob("week-*")):
         script_path = folder / "script.json"
         if not script_path.exists():
             continue
@@ -80,8 +83,9 @@ def prerender_all(log=print) -> dict:
 
 
 if __name__ == "__main__":
+    sid = sys.argv[1] if len(sys.argv) > 1 else None
     try:
-        print(json.dumps(prerender_all()))
+        print(json.dumps(prerender_all(sid)))
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
         raise SystemExit(1)

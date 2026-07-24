@@ -86,6 +86,8 @@ class Lecture:
     week: int
     title: str
     segments: list[dict]
+    # The owner (studentId). Scopes RAG retrieval for live Q&A and the qa_log.
+    sid: str = ""
     position: Position = field(default_factory=Position)
     # Pre-rendered voice (prerender_audio.py, this cave). When present, the
     # lecture NEVER touches a TTS model — it plays from disk.
@@ -93,10 +95,11 @@ class Lecture:
     audio_rate: int | None = None
 
     @staticmethod
-    def load(week: int) -> "Lecture":
-        folder = LECTURES_DIR / f"week-{week}"
+    def load(sid: str, week: int) -> "Lecture":
+        # Per-student course on disk: lectures/<studentId>/week-N/.
+        folder = LECTURES_DIR / sid / f"week-{week}"
         script = json.loads((folder / "script.json").read_text("utf-8"))
-        lecture = Lecture(week=week, title=script["title"], segments=script["segments"])
+        lecture = Lecture(week=week, title=script["title"], segments=script["segments"], sid=sid)
         meta = folder / "audio" / "meta.json"
         if meta.exists():
             lecture.audio_dir = folder / "audio"
@@ -378,7 +381,9 @@ class LectureSession:
             log(f"[qa] {stage}: {detail}" if detail else f"[qa] {stage}")
             await self.send({"type": "progress", "stage": stage, "detail": detail})
 
-        result = await answer_question(question, lecture_id=None, on_progress=on_progress)
+        result = await answer_question(
+            question, lecture_id=None, sid=self.lecture.sid, on_progress=on_progress
+        )
         await self.send({"type": "progress", "stage": "speaking", "detail": ""})
 
         await self.send(
@@ -563,10 +568,16 @@ def prewarm(proc: agents.JobProcess) -> None:
 async def entrypoint(ctx: agents.JobContext) -> None:
     await ctx.connect()
 
-    # Room names are lecture-week-N, so the week is the source of truth here.
-    week = int(ctx.room.name.rsplit("-", 1)[-1])
-    lecture = Lecture.load(week)
-    print(f"[lecture] week {week}: {lecture.title} ({len(lecture.segments)} segments)")
+    # Room names are lecture-<studentId>-week-N (the app's token route mints
+    # them). rpartition on "-week-" is safe even though studentId itself
+    # contains dashes (S-2026-000042).
+    prefix, sep, week_str = ctx.room.name.rpartition("-week-")
+    if not sep or not prefix.startswith("lecture-"):
+        raise ValueError(f"unexpected room name: {ctx.room.name}")
+    sid = prefix[len("lecture-") :]
+    week = int(week_str)
+    lecture = Lecture.load(sid, week)
+    print(f"[lecture] {sid} week {week}: {lecture.title} ({len(lecture.segments)} segments)")
 
     session = LectureSession(ctx.room, lecture, ctx.proc.userdata["tts"])
     prompts_rate = ctx.proc.userdata.get("prompts_rate")

@@ -66,20 +66,23 @@ _LOG_TASKS: set = set()
 
 
 def _log_later(
-    lecture_id: int | None, question: str, answer: str, pages: list[int], model: str
+    lecture_id: int | None, sid: str | None, question: str, answer: str, pages: list[int], model: str
 ) -> None:
     task = asyncio.create_task(
-        asyncio.to_thread(_log, lecture_id, question, answer, pages, model)
+        asyncio.to_thread(_log, lecture_id, sid, question, answer, pages, model)
     )
     _LOG_TASKS.add(task)
     task.add_done_callback(_LOG_TASKS.discard)
 
 
-async def answer_question(question: str, lecture_id: int | None, on_progress=None) -> dict:
+async def answer_question(
+    question: str, lecture_id: int | None, sid: str | None = None, on_progress=None
+) -> dict:
     """Returns {answer, pages, model_used}. Never raises: the lecture must go on.
 
-    on_progress(stage: str, detail: str) is awaited at each step so the browser
-    can show WHERE the answer currently is instead of looking frozen."""
+    sid (the student's studentId) scopes RAG retrieval to THEIR book and stamps
+    the qa_log row. on_progress(stage, detail) is awaited at each step so the
+    browser can show WHERE the answer currently is instead of looking frozen."""
 
     async def progress(stage: str, detail: str = "") -> None:
         if on_progress:
@@ -91,7 +94,7 @@ async def answer_question(question: str, lecture_id: int | None, on_progress=Non
 
     try:
         await progress("retrieving", "")
-        hits = await search_book(question, top_k=5)
+        hits = await search_book(question, top_k=5, user_id=sid)
         await progress(
             "retrieved",
             f"{len(hits)} passages in {time.perf_counter() - started:.1f}s",
@@ -103,11 +106,11 @@ async def answer_question(question: str, lecture_id: int | None, on_progress=Non
     except Exception as exc:
         print(f"[qa] RAG failed: {exc}")
         await progress("problem", "book search failed - apologising and moving on")
-        _log_later(lecture_id, question, TROUBLE, [], "")
+        _log_later(lecture_id, sid, question, TROUBLE, [], "")
         return {"answer": TROUBLE, "pages": [], "model_used": ""}
 
     if not hits:
-        _log_later(lecture_id, question, NOT_IN_BOOK, [], "")
+        _log_later(lecture_id, sid, question, NOT_IN_BOOK, [], "")
         return {"answer": NOT_IN_BOOK, "pages": [], "model_used": ""}
 
     # Their reranker can hand back the same chunk twice; feeding duplicates to a small
@@ -160,18 +163,21 @@ async def answer_question(question: str, lecture_id: int | None, on_progress=Non
     if refused:
         cited = []
 
-    _log_later(lecture_id, question, answer, cited, model_used)
+    _log_later(lecture_id, sid, question, answer, cited, model_used)
     return {"answer": answer, "pages": cited, "model_used": model_used}
 
 
-def _log(lecture_id: int | None, question: str, answer: str, pages: list[int], model: str) -> None:
+def _log(
+    lecture_id: int | None, sid: str | None, question: str, answer: str, pages: list[int], model: str
+) -> None:
     import json
 
     try:
         execute(
-            "INSERT INTO qa_log (lecture_id, question, answer, citations, model_used, asked_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
+            "INSERT INTO qa_log (student_id, lecture_id, question, answer, citations, model_used, asked_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (
+                sid,
                 lecture_id,
                 question,
                 answer,
