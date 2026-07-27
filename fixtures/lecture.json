@@ -1,0 +1,21 @@
+{
+  "lectureId": "week-1",
+  "title": "Evidence and Tenant Isolation",
+  "segments": [
+    {
+      "slide": 1,
+      "text": "Welcome. This project-authored lecture explains grounded answers and learner ownership.",
+      "citations": [{"page": 1}]
+    },
+    {
+      "slide": 2,
+      "text": "Tenant filtering keeps each learner's indexed material separate from every other learner.",
+      "citations": [{"page": 2}]
+    },
+    {
+      "slide": 3,
+      "text": "Explicit runtime modes prevent deterministic fixtures from appearing in integrated production behaviour.",
+      "citations": [{"page": 3}]
+    }
+  ]
+}

@@ -33,6 +33,14 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from runtime import RuntimeMode, runtime_mode
+
+if runtime_mode() is RuntimeMode.STANDALONE:
+    raise RuntimeError(
+        "worker.py is the integrated LiveKit entry point. "
+        "Use 'python simulate.py run' for standalone mode."
+    )
+
 # This cave (UnivAI-live) is checked out inside the UnivAI campus repo; the
 # shared plumbing (clock, db, LLM, RAG client) lives there in services/.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
@@ -571,11 +579,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # Room names are lecture-<studentId>-week-N (the app's token route mints
     # them). rpartition on "-week-" is safe even though studentId itself
     # contains dashes (S-2026-000042).
-    prefix, sep, week_str = ctx.room.name.rpartition("-week-")
-    if not sep or not prefix.startswith("lecture-"):
-        raise ValueError(f"unexpected room name: {ctx.room.name}")
-    sid = prefix[len("lecture-") :]
-    week = int(week_str)
+    from protocol import parse_room_name
+
+    sid, week = parse_room_name(ctx.room.name)
     lecture = Lecture.load(sid, week)
     print(f"[lecture] {sid} week {week}: {lecture.title} ({len(lecture.segments)} segments)")
 
