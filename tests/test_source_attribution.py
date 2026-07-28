@@ -21,18 +21,19 @@ from citations import enrich_citations
 
 class TestCitationRecord(unittest.TestCase):
     def test_construction_with_page_only(self) -> None:
-        c = CitationRecord(page=5)
+        c = CitationRecord(source="book.pdf", page=5)
         self.assertEqual(5, c.page)
         self.assertEqual("", c.programme_id)
         self.assertEqual("", c.chunk_id)
 
     def test_construction_with_all_fields(self) -> None:
         c = CitationRecord(
+            source="book.pdf",
             page=12,
             programme_id="prog-001",
             course_id="course-ai",
             lecture_id="lec-wk2",
-            plan_version="v3",
+            plan_version=3,
             chunk_id="chunk-abc",
         )
         self.assertEqual(12, c.page)
@@ -40,7 +41,7 @@ class TestCitationRecord(unittest.TestCase):
         self.assertEqual("chunk-abc", c.chunk_id)
 
     def test_as_dict_contains_required_keys(self) -> None:
-        c = CitationRecord(page=7, programme_id="p", course_id="c")
+        c = CitationRecord(source="book.pdf", page=7, programme_id="p", course_id="c")
         d = c.as_dict()
         self.assertIn("page", d)
         self.assertIn("programme_id", d)
@@ -56,45 +57,45 @@ class TestBuildSpokenCitation(unittest.TestCase):
         self.assertEqual("", build_spoken_citation([]))
 
     def test_single_page(self) -> None:
-        result = build_spoken_citation([CitationRecord(page=5)])
-        self.assertEqual("You can read that on page 5.", result)
+        result = build_spoken_citation([CitationRecord(source="book.pdf", page=5)])
+        self.assertEqual("You can read that in book.pdf on page 5.", result)
 
     def test_two_pages(self) -> None:
         result = build_spoken_citation([
-            CitationRecord(page=2),
-            CitationRecord(page=7),
+            CitationRecord(source="book.pdf", page=2),
+            CitationRecord(source="book.pdf", page=7),
         ])
-        self.assertEqual("You can read that on pages 2 and 7.", result)
+        self.assertEqual("You can read that in book.pdf on pages 2 and 7.", result)
 
     def test_three_pages_uses_first_two(self) -> None:
         result = build_spoken_citation([
-            CitationRecord(page=1),
-            CitationRecord(page=3),
-            CitationRecord(page=9),
+            CitationRecord(source="book.pdf", page=1),
+            CitationRecord(source="book.pdf", page=3),
+            CitationRecord(source="book.pdf", page=9),
         ])
-        self.assertEqual("You can read that on pages 1 and 3.", result)
+        self.assertEqual("You can read that in book.pdf on pages 1 and 3.", result)
 
     def test_duplicate_pages_deduplicated(self) -> None:
         result = build_spoken_citation([
-            CitationRecord(page=4),
-            CitationRecord(page=4),
+            CitationRecord(source="book.pdf", page=4),
+            CitationRecord(source="book.pdf", page=4),
         ])
-        self.assertEqual("You can read that on page 4.", result)
+        self.assertEqual("You can read that in book.pdf on page 4.", result)
 
     def test_zero_or_negative_page_ignored(self) -> None:
         result = build_spoken_citation([
-            CitationRecord(page=0),
-            CitationRecord(page=-1),
-            CitationRecord(page=3),
+            CitationRecord(source="book.pdf", page=0),
+            CitationRecord(source="book.pdf", page=-1),
+            CitationRecord(source="book.pdf", page=3),
         ])
-        self.assertEqual("You can read that on page 3.", result)
+        self.assertEqual("You can read that in book.pdf on page 3.", result)
 
 
 class TestValidateAttributedAnswer(unittest.TestCase):
     def test_grounded_answer_with_citations_passes(self) -> None:
         obj = AttributedAnswer(
             answer="The answer is X.",
-            citations=[CitationRecord(page=2)],
+            citations=[CitationRecord(source="book.pdf", page=2)],
             refused=False,
         )
         # Must not raise
@@ -129,7 +130,7 @@ class TestValidateAttributedAnswer(unittest.TestCase):
     def test_refused_with_citations_raises(self) -> None:
         obj = AttributedAnswer(
             answer="That is not covered in your book.",
-            citations=[CitationRecord(page=5)],
+            citations=[CitationRecord(source="book.pdf", page=5)],
             refused=True,
         )
         with self.assertRaises(ValueError) as ctx:
@@ -142,13 +143,14 @@ class TestEnrichCitations(unittest.TestCase):
         "programme_id": "prog-demo",
         "course_id": "course-demo",
         "lecture_id": "lec-demo",
-        "plan_version": "v1",
+        "plan_version": 1,
     }
 
     def test_grounded_result_produces_citations(self) -> None:
         raw = {
             "answer": "Tenant filtering keeps each learner's material separate. You can read that on page 2.",
             "pages": [2],
+            "citations": [{"source": "book.pdf", "page": 2}],
             "model_used": "test-model",
         }
         result = enrich_citations(raw, **self.SCOPE)
@@ -183,6 +185,10 @@ class TestEnrichCitations(unittest.TestCase):
         raw = {
             "answer": "Some answer. You can read that on pages 3 and 3.",
             "pages": [3, 3],
+            "citations": [
+                {"source": "book.pdf", "page": 3},
+                {"source": "book.pdf", "page": 3},
+            ],
             "model_used": "m",
         }
         result = enrich_citations(raw, **self.SCOPE)
@@ -193,6 +199,10 @@ class TestEnrichCitations(unittest.TestCase):
         raw = {
             "answer": "Grounded answer. You can read that on pages 1 and 2.",
             "pages": [1, 2],
+            "citations": [
+                {"source": "book.pdf", "page": 1},
+                {"source": "book.pdf", "page": 2},
+            ],
             "model_used": "m",
         }
         result = enrich_citations(
@@ -200,28 +210,33 @@ class TestEnrichCitations(unittest.TestCase):
             programme_id="prog-X",
             course_id="course-Y",
             lecture_id="lec-Z",
-            plan_version="v9",
+            plan_version=9,
         )
         for c in result.citations:
             self.assertEqual("prog-X", c.programme_id)
             self.assertEqual("course-Y", c.course_id)
             self.assertEqual("lec-Z", c.lecture_id)
-            self.assertEqual("v9", c.plan_version)
+            self.assertEqual(9, c.plan_version)
 
     def test_spoken_citation_matches_pages(self) -> None:
         raw = {
             "answer": "Grounded. You can read that on page 5.",
             "pages": [5],
+            "citations": [{"source": "book.pdf", "page": 5}],
             "model_used": "m",
         }
         result = enrich_citations(raw, **self.SCOPE)
-        self.assertEqual("You can read that on page 5.", result.spoken_citation)
+        self.assertEqual(
+            "You can read that in book.pdf on page 5.",
+            result.spoken_citation,
+        )
 
     def test_citation_dicts_are_json_safe(self) -> None:
         import json
         raw = {
             "answer": "Grounded. You can read that on page 7.",
             "pages": [7],
+            "citations": [{"source": "book.pdf", "page": 7}],
             "model_used": "m",
         }
         result = enrich_citations(raw, **self.SCOPE)
@@ -233,11 +248,12 @@ class TestEnrichCitations(unittest.TestCase):
         raw = {
             "answer": "Grounded. You can read that on page 2.",
             "pages": [2],
+            "citations": [{"source": "book.pdf", "page": 2}],
             "model_used": "m",
         }
         result = enrich_citations(raw)
         self.assertEqual("", result.citations[0].programme_id)
-        self.assertEqual("", result.citations[0].plan_version)
+        self.assertIsNone(result.citations[0].plan_version)
 
 
 if __name__ == "__main__":

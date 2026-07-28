@@ -84,7 +84,7 @@ async def answer_question(
     *,
     programme_id: str = "",
     course_id: str = "",
-    plan_version: str = "",
+    plan_version: int | None = None,
     lecture_id_str: str = "",
 ) -> dict:
     """Returns {answer, pages, model_used, citations}. Never raises: the lecture must go on.
@@ -115,7 +115,8 @@ async def answer_question(
     except RagUnavailable as exc:
         print(f"[qa] RAG not configured: {exc}")
         await progress("problem", f"book search unavailable ({exc})")
-        hits = []
+        _log_later(lecture_id, sid, question, TROUBLE, [], "")
+        return {"answer": TROUBLE, "pages": [], "model_used": "", "citations": []}
     except Exception as exc:
         print(f"[qa] RAG failed: {exc}")
         await progress("problem", "book search failed - apologising and moving on")
@@ -129,6 +130,7 @@ async def answer_question(
     # Their reranker can hand back the same chunk twice; feeding duplicates to a small
     # model just wastes its context.
     passages = []
+    raw_citations: list[dict] = []
     seen: set[str] = set()
     for hit in hits:
         if len(passages) >= MAX_PASSAGES:
@@ -140,6 +142,13 @@ async def answer_question(
         page = hit.get("page")
         if isinstance(page, int):
             pages.append(page)
+        raw_citations.append(
+            {
+                "source": str(hit.get("source") or "").strip(),
+                "page": page if isinstance(page, int) else None,
+                "chunk_id": str(hit.get("chunk_id") or ""),
+            }
+        )
         passages.append(f"[page {page}] {text}")
 
     prompt = (
@@ -168,32 +177,40 @@ async def answer_question(
 
     cited = sorted(set(pages))
 
-    # The page reference is OURS, taken from the RAG metadata — never the model's word.
     refused = NOT_COVERED in answer.lower()
-    if cited and not refused and answer != TROUBLE:
-        where = f"page {cited[0]}" if len(cited) == 1 else f"pages {cited[0]} and {cited[1]}"
-        answer = f"{answer.rstrip('.')}. You can read that on {where}."
-    if refused:
+    if refused or answer == TROUBLE:
         cited = []
-
-    _log_later(lecture_id, sid, question, answer, cited, model_used)
+        raw_citations = []
 
     # Enrich with typed citation records carrying session identity.
     # enrich_citations() validates the result; on an internal inconsistency it
     # raises ValueError — caught here so a pipeline bug never crashes the room.
     try:
         attributed = enrich_citations(
-            {"answer": answer, "pages": cited, "model_used": model_used},
+            {
+                "answer": answer,
+                "pages": cited,
+                "citations": raw_citations,
+                "model_used": model_used,
+            },
             programme_id=programme_id,
             course_id=course_id,
             lecture_id=lecture_id_str,
             plan_version=plan_version,
         )
+        if attributed.spoken_citation:
+            answer = answer.rstrip()
+            if not answer.endswith((".", "!", "?")):
+                answer = f"{answer}."
+            answer = f"{answer} {attributed.spoken_citation}"
         citations_payload = attributed.citation_dicts()
     except ValueError as exc:
         print(f"[qa] citation enrichment validation error: {exc}")
-        citations_payload = [{"page": p} for p in cited]
+        answer = TROUBLE
+        cited = []
+        citations_payload = []
 
+    _log_later(lecture_id, sid, question, answer, cited, model_used)
     return {"answer": answer, "pages": cited, "model_used": model_used, "citations": citations_payload}
 
 

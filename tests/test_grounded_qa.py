@@ -11,12 +11,8 @@ These tests verify:
 No real network calls, no LLM, no RAG, no database, no LiveKit are made.
 All external calls within qa.py are patched using unittest.mock.
 
-Design note: qa.py imports from services/ at module level. We cannot import
-qa directly in this process (services/ requires LIVEKIT_URL etc. at import
-time on some setups). Instead we patch the specific callable paths that
-answer_question() actually calls at runtime. If the import chain fails for
-the usual integrated-only reasons, the test class is skipped with a clear
-reason — it never silently passes.
+The campus service modules are stubbed before importing qa.py. An import
+failure fails test collection; this suite never skips the production module.
 """
 
 from __future__ import annotations
@@ -78,28 +74,30 @@ sys.modules["common.rag_client"] = _stub_rag
 sys.modules["common.device"] = MagicMock()
 sys.modules["common.sentences"] = MagicMock(split_sentences=lambda t: [t])
 
-try:
-    # qa.py lives in the parent directory of tests/
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    import qa as _qa_module  # noqa: E402
-
-    QA_AVAILABLE = True
-except Exception as exc:  # pragma: no cover
-    QA_AVAILABLE = False
-    QA_IMPORT_ERROR = str(exc)
+# qa.py lives in the parent directory of tests/. Import failures are test
+# failures; this suite must never silently skip the production Q&A module.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import qa as _qa_module  # noqa: E402
 
 _SCOPE = {
     "programme_id": "prog-test",
     "course_id": "course-test",
     "lecture_id_str": "lec-wk1",
-    "plan_version": "v1",
+    "plan_version": 1,
 }
 
-_RAG_HIT_PAGE_2 = {"text": "Tenant filtering keeps material separate.", "page": 2}
-_RAG_HIT_PAGE_5 = {"text": "The plan version governs approved content.", "page": 5}
+_RAG_HIT_PAGE_2 = {
+    "text": "Tenant filtering keeps material separate.",
+    "page": 2,
+    "source": "tenant-guide.pdf",
+}
+_RAG_HIT_PAGE_5 = {
+    "text": "The plan version governs approved content.",
+    "page": 5,
+    "source": "programme-guide.pdf",
+}
 
 
-@unittest.skipUnless(QA_AVAILABLE, f"qa import failed: {'' if QA_AVAILABLE else 'see QA_IMPORT_ERROR'}")
 class TestAnswerQuestionMocked(unittest.TestCase):
     """Each test patches only the callables that answer_question uses at runtime."""
 
@@ -126,6 +124,7 @@ class TestAnswerQuestionMocked(unittest.TestCase):
         self.assertIsInstance(result["citations"], list)
         self.assertEqual(1, len(result["citations"]))
         self.assertEqual(2, result["citations"][0]["page"])
+        self.assertEqual("tenant-guide.pdf", result["citations"][0]["source"])
         self.assertEqual("prog-test", result["citations"][0]["programme_id"])
 
     def test_grounded_answer_appends_spoken_page_reference(self) -> None:
@@ -138,6 +137,7 @@ class TestAnswerQuestionMocked(unittest.TestCase):
                 _qa_module.answer_question("How is tenant material protected?", lecture_id=None)
             )
         self.assertIn("page 2", result["answer"])
+        self.assertIn("tenant-guide.pdf", result["answer"])
 
     def test_out_of_scope_question_returns_refusal(self) -> None:
         """A question the book doesn't cover: RAG returns empty hits."""
@@ -177,7 +177,9 @@ class TestAnswerQuestionMocked(unittest.TestCase):
                 _qa_module.answer_question("Any question?", lecture_id=None)
             )
         # With empty hits we get NOT_IN_BOOK, not TROUBLE — still a graceful refusal.
-        self.assertIn("not covered", result["answer"].lower())
+        self.assertIn("trouble", result["answer"].lower())
+        self.assertEqual([], result["pages"])
+        self.assertEqual([], result["citations"])
         self.assertEqual([], result["pages"])
 
     def test_rag_exception_returns_trouble_fallback_without_raising(self) -> None:
@@ -202,6 +204,28 @@ class TestAnswerQuestionMocked(unittest.TestCase):
                 _qa_module.answer_question("A question?", lecture_id=None)
             )
         self.assertIn("trouble", result["answer"].lower())
+
+    def test_grounded_answer_without_source_identity_fails_closed(self) -> None:
+        hit_without_source = {"text": "A grounded-looking passage.", "page": 2}
+        with (
+            patch.object(
+                _qa_module,
+                "search_book",
+                AsyncMock(return_value=[hit_without_source]),
+            ),
+            patch.object(
+                _qa_module,
+                "complete",
+                MagicMock(return_value=_LLMResult("A grounded-looking answer.")),
+            ),
+            patch.object(_qa_module, "_log_later", MagicMock()),
+        ):
+            result = self._run(
+                _qa_module.answer_question("Question?", lecture_id=None)
+            )
+
+        self.assertIn("trouble", result["answer"].lower())
+        self.assertEqual([], result["citations"])
 
     def test_answer_question_never_raises(self) -> None:
         """contract: answer_question must never propagate an exception."""
@@ -252,7 +276,7 @@ class TestAnswerQuestionMocked(unittest.TestCase):
                     lecture_id=None,
                     programme_id="prog-XYZ",
                     course_id="course-ABC",
-                    plan_version="v99",
+                    plan_version=99,
                     lecture_id_str="lec-wk99",
                 )
             )
@@ -260,7 +284,7 @@ class TestAnswerQuestionMocked(unittest.TestCase):
         c = result["citations"][0]
         self.assertEqual("prog-XYZ", c["programme_id"])
         self.assertEqual("course-ABC", c["course_id"])
-        self.assertEqual("v99", c["plan_version"])
+        self.assertEqual(99, c["plan_version"])
         self.assertEqual("lec-wk99", c["lecture_id"])
 
 
