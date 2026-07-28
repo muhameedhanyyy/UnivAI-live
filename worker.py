@@ -51,6 +51,7 @@ from livekit import agents, rtc
 
 from common.device import whisper_settings, describe  # noqa: E402
 from common.sentences import split_sentences  # noqa: E402
+from protocols.lecture_session import LectureSessionMeta, SessionMetadataError  # noqa: E402
 from qa import answer_question  # noqa: E402
 from tts import load_live_engine  # noqa: E402
 
@@ -125,9 +126,10 @@ class Lecture:
 
 
 class LectureSession:
-    def __init__(self, room: rtc.Room, lecture: Lecture, tts) -> None:
+    def __init__(self, room: rtc.Room, lecture: Lecture, tts, session_meta: LectureSessionMeta | None = None) -> None:
         self.room = room
         self.lecture = lecture
+        self.session_meta = session_meta
         # Loaded in prewarm(). May be None on a RAM-starved machine — the
         # lecture still plays (pre-rendered on disk); only live answers then
         # need the on-demand Piper fallback in _engine().
@@ -389,8 +391,16 @@ class LectureSession:
             log(f"[qa] {stage}: {detail}" if detail else f"[qa] {stage}")
             await self.send({"type": "progress", "stage": stage, "detail": detail})
 
+        # Forward session identity to qa so citations carry programme/course/plan
+        # scope. Falls back to empty strings when session_meta was not available
+        # (only possible in standalone mode where worker.py is not used).
+        scope = self.session_meta.as_citation_scope() if self.session_meta else {}
         result = await answer_question(
-            question, lecture_id=None, sid=self.lecture.sid, on_progress=on_progress
+            question, lecture_id=None, sid=self.lecture.sid, on_progress=on_progress,
+            programme_id=scope.get("programme_id", ""),
+            course_id=scope.get("course_id", ""),
+            plan_version=scope.get("plan_version", ""),
+            lecture_id_str=scope.get("lecture_id", ""),
         )
         await self.send({"type": "progress", "stage": "speaking", "detail": ""})
 
@@ -401,6 +411,7 @@ class LectureSession:
                     "question": question,
                     "answer": result["answer"],
                     "pages": result["pages"],
+                    "citations": result.get("citations", []),
                 },
             }
         )
@@ -585,7 +596,31 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     lecture = Lecture.load(sid, week)
     print(f"[lecture] {sid} week {week}: {lecture.title} ({len(lecture.segments)} segments)")
 
-    session = LectureSession(ctx.room, lecture, ctx.proc.userdata["tts"])
+    # Parse extended session metadata from roomMetadata (App → Live contract).
+    # A missing or invalid blob is logged and reported to the room but does NOT
+    # stop the lecture — citations degrade to page-only (scope fields are empty).
+    session_meta: LectureSessionMeta | None = None
+    raw_meta = getattr(ctx.room, "metadata", None) or ""
+    try:
+        session_meta = LectureSessionMeta.from_room_metadata(
+            ctx.room.name, raw_meta, sid=sid
+        )
+        print(
+            f"[lecture] session metadata: programme={session_meta.programme_id} "
+            f"course={session_meta.course_id} plan={session_meta.plan_version}"
+        )
+    except SessionMetadataError as exc:
+        print(f"[lecture] WARNING: {exc} (field={exc.field!r}) — citations will lack scope")
+        await ctx.room.local_participant.publish_data(
+            json.dumps({
+                "type": "progress",
+                "stage": "problem",
+                "detail": f"session metadata missing field '{exc.field}' — citations degraded",
+            }).encode("utf-8"),
+            reliable=True,
+        )
+
+    session = LectureSession(ctx.room, lecture, ctx.proc.userdata["tts"], session_meta)
     prompts_rate = ctx.proc.userdata.get("prompts_rate")
     session.prompts = {
         key: session._fit(audio, prompts_rate)

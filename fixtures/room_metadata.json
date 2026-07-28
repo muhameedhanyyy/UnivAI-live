@@ -1,0 +1,9 @@
+{
+  "_comment": "Canonical standalone roomMetadata fixture. Schema version 1. See protocols/lecture_session.py.",
+  "_schema_version": "1",
+  "programme_id": "programme-demo-001",
+  "course_id": "course-demo-001",
+  "plan_version": "v1",
+  "week": 1,
+  "lecture_id": "lecture-week-1"
+}

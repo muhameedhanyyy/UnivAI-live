@@ -20,6 +20,7 @@ from common.clock import now  # noqa: E402
 from common.db import execute  # noqa: E402
 from common.llm import complete, LLMError, TIMEOUT_QA_S  # noqa: E402
 from common.rag_client import search_book, RagUnavailable  # noqa: E402
+from citations import enrich_citations  # noqa: E402
 
 # Three short spoken sentences are ~60 tokens. The old uncapped call let the
 # model ramble to its 180-token default — well over a minute of SPOKEN speech
@@ -76,13 +77,25 @@ def _log_later(
 
 
 async def answer_question(
-    question: str, lecture_id: int | None, sid: str | None = None, on_progress=None
+    question: str,
+    lecture_id: int | None,
+    sid: str | None = None,
+    on_progress=None,
+    *,
+    programme_id: str = "",
+    course_id: str = "",
+    plan_version: str = "",
+    lecture_id_str: str = "",
 ) -> dict:
-    """Returns {answer, pages, model_used}. Never raises: the lecture must go on.
+    """Returns {answer, pages, model_used, citations}. Never raises: the lecture must go on.
 
     sid (the student's studentId) scopes RAG retrieval to THEIR book and stamps
     the qa_log row. on_progress(stage, detail) is awaited at each step so the
-    browser can show WHERE the answer currently is instead of looking frozen."""
+    browser can show WHERE the answer currently is instead of looking frozen.
+
+    programme_id, course_id, plan_version, lecture_id_str carry the session
+    identity from LectureSessionMeta and are attached to each citation record.
+    They default to empty string for backward-compatible callers."""
 
     async def progress(stage: str, detail: str = "") -> None:
         if on_progress:
@@ -107,11 +120,11 @@ async def answer_question(
         print(f"[qa] RAG failed: {exc}")
         await progress("problem", "book search failed - apologising and moving on")
         _log_later(lecture_id, sid, question, TROUBLE, [], "")
-        return {"answer": TROUBLE, "pages": [], "model_used": ""}
+        return {"answer": TROUBLE, "pages": [], "model_used": "", "citations": []}
 
     if not hits:
         _log_later(lecture_id, sid, question, NOT_IN_BOOK, [], "")
-        return {"answer": NOT_IN_BOOK, "pages": [], "model_used": ""}
+        return {"answer": NOT_IN_BOOK, "pages": [], "model_used": "", "citations": []}
 
     # Their reranker can hand back the same chunk twice; feeding duplicates to a small
     # model just wastes its context.
@@ -164,7 +177,24 @@ async def answer_question(
         cited = []
 
     _log_later(lecture_id, sid, question, answer, cited, model_used)
-    return {"answer": answer, "pages": cited, "model_used": model_used}
+
+    # Enrich with typed citation records carrying session identity.
+    # enrich_citations() validates the result; on an internal inconsistency it
+    # raises ValueError — caught here so a pipeline bug never crashes the room.
+    try:
+        attributed = enrich_citations(
+            {"answer": answer, "pages": cited, "model_used": model_used},
+            programme_id=programme_id,
+            course_id=course_id,
+            lecture_id=lecture_id_str,
+            plan_version=plan_version,
+        )
+        citations_payload = attributed.citation_dicts()
+    except ValueError as exc:
+        print(f"[qa] citation enrichment validation error: {exc}")
+        citations_payload = [{"page": p} for p in cited]
+
+    return {"answer": answer, "pages": cited, "model_used": model_used, "citations": citations_payload}
 
 
 def _log(
