@@ -22,9 +22,13 @@ from protocols.lecture_session import (
 VALID_METADATA: dict = {
     "programme_id": "programme-cs-2026",
     "course_id": "course-ai-101",
-    "plan_version": "v2",
+    "plan_version": 2,
     "week": 3,
     "lecture_id": "lecture-week-3",
+    "segments": [
+        {"order": 1, "slide": 0, "text": "First segment."},
+        {"order": 2, "slide": 1, "text": "Second segment."},
+    ],
 }
 
 VALID_ROOM_NAME = "lecture-S-2026-000042-week-3"
@@ -63,7 +67,7 @@ class TestFromRoomMetadataIntegrated(unittest.TestCase):
         result = self._run_integrated(run)
         self.assertEqual("programme-cs-2026", result.programme_id)
         self.assertEqual("course-ai-101", result.course_id)
-        self.assertEqual("v2", result.plan_version)
+        self.assertEqual(2, result.plan_version)
         self.assertEqual(3, result.week)
         self.assertEqual("lecture-week-3", result.lecture_id)
         self.assertEqual("S-2026-000042", result.sid)
@@ -119,7 +123,7 @@ class TestFromRoomMetadataIntegrated(unittest.TestCase):
         self.assertEqual("course_id", ctx.exception.field)
 
     def test_empty_plan_version_raises(self) -> None:
-        data = dict(VALID_METADATA, plan_version="   ")
+        data = dict(VALID_METADATA, plan_version=0)
         def run():
             LectureSessionMeta.from_room_metadata(VALID_ROOM_NAME, json.dumps(data))
         with self.assertRaises(SessionMetadataError) as ctx:
@@ -141,6 +145,38 @@ class TestFromRoomMetadataIntegrated(unittest.TestCase):
         with self.assertRaises(SessionMetadataError):
             self._run_integrated(run)
 
+    def test_segments_must_be_contiguously_ordered(self) -> None:
+        data = dict(
+            VALID_METADATA,
+            segments=[{"order": 2, "slide": 0, "text": "Out of order."}],
+        )
+
+        def run():
+            LectureSessionMeta.from_room_metadata(
+                VALID_ROOM_NAME,
+                json.dumps(data),
+            )
+
+        with self.assertRaises(SessionMetadataError) as ctx:
+            self._run_integrated(run)
+        self.assertEqual("segments", ctx.exception.field)
+
+    def test_segments_must_contain_spoken_text(self) -> None:
+        data = dict(
+            VALID_METADATA,
+            segments=[{"order": 1, "slide": 0, "text": "   "}],
+        )
+
+        def run():
+            LectureSessionMeta.from_room_metadata(
+                VALID_ROOM_NAME,
+                json.dumps(data),
+            )
+
+        with self.assertRaises(SessionMetadataError) as ctx:
+            self._run_integrated(run)
+        self.assertEqual("segments", ctx.exception.field)
+
 
 class TestFromRoomMetadataStandalone(unittest.TestCase):
     """In standalone mode absent metadata falls back to standalone_fixture()."""
@@ -152,7 +188,7 @@ class TestFromRoomMetadataStandalone(unittest.TestCase):
         )
         # Fields must be clearly labelled as fixture values.
         self.assertTrue(result.programme_id.startswith("programme-demo"))
-        self.assertEqual("v1", result.plan_version)
+        self.assertEqual(1, result.plan_version)
 
     def test_valid_metadata_still_validated_in_standalone(self) -> None:
         result = LectureSessionMeta.from_room_metadata(
@@ -166,7 +202,7 @@ class TestStandaloneFixture(unittest.TestCase):
         meta = LectureSessionMeta.standalone_fixture()
         self.assertEqual("programme-demo-001", meta.programme_id)
         self.assertEqual("course-demo-001", meta.course_id)
-        self.assertEqual("v1", meta.plan_version)
+        self.assertEqual(1, meta.plan_version)
         self.assertEqual(1, meta.week)
         self.assertEqual("lecture-week-1", meta.lecture_id)
         self.assertEqual("S-2026-000042", meta.sid)
@@ -210,7 +246,7 @@ class TestCanonicalFixtureJson(unittest.TestCase):
             STANDALONE_ROOM_METADATA,
         )
         self.assertEqual("programme-demo-001", result.programme_id)
-        self.assertEqual("v1", result.plan_version)
+        self.assertEqual(1, result.plan_version)
 
 
 if __name__ == "__main__":

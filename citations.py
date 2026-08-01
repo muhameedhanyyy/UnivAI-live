@@ -37,7 +37,7 @@ def enrich_citations(
     programme_id: str = "",
     course_id: str = "",
     lecture_id: str = "",
-    plan_version: str = "",
+    plan_version: int | None = None,
 ) -> AttributedAnswer:
     """Build a validated ``AttributedAnswer`` from a raw ``qa.answer_question`` dict.
 
@@ -66,6 +66,7 @@ def enrich_citations(
     """
     answer: str = qa_result.get("answer", "")
     raw_pages: list = qa_result.get("pages", [])
+    raw_citations: list = qa_result.get("citations", [])
     model_used: str = qa_result.get("model_used", "")
 
     refused = _NOT_COVERED_SENTINEL in answer.lower()
@@ -73,18 +74,30 @@ def enrich_citations(
 
     citations: list[CitationRecord] = []
     if not refused and not is_trouble:
-        # Deduplicate pages; preserve relative order.
-        seen: set[int] = set()
-        for page in raw_pages:
-            if isinstance(page, int) and page > 0 and page not in seen:
-                seen.add(page)
+        candidates = raw_citations or [
+            {"source": "", "page": page} for page in raw_pages
+        ]
+        seen: set[tuple[str, int | None]] = set()
+        for raw in candidates:
+            if not isinstance(raw, dict):
+                continue
+            source = raw.get("source")
+            page = raw.get("page")
+            normalized_page = page if isinstance(page, int) and page > 0 else None
+            if not isinstance(source, str):
+                source = ""
+            identity = (source.strip(), normalized_page)
+            if identity not in seen:
+                seen.add(identity)
                 citations.append(
                     CitationRecord(
-                        page=page,
+                        source=source.strip(),
+                        page=normalized_page,
                         programme_id=programme_id,
                         course_id=course_id,
                         lecture_id=lecture_id,
                         plan_version=plan_version,
+                        chunk_id=str(raw.get("chunk_id") or ""),
                     )
                 )
 

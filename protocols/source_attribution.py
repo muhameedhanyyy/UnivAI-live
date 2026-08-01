@@ -55,16 +55,18 @@ class CitationRecord:
         RAG chunk identifier when available; empty string otherwise.
     """
 
-    page: int
+    source: str
+    page: int | None = None
     programme_id: str = ""
     course_id: str = ""
     lecture_id: str = ""
-    plan_version: str = ""
+    plan_version: int | None = None
     chunk_id: str = ""
 
     def as_dict(self) -> dict:
         """Serialise to a JSON-safe dict for the answer payload."""
         return {
+            "source": self.source,
             "page": self.page,
             "programme_id": self.programme_id,
             "course_id": self.course_id,
@@ -113,17 +115,27 @@ def build_spoken_citation(citations: list[CitationRecord]) -> str:
     --------
     >>> build_spoken_citation([])
     ''
-    >>> build_spoken_citation([CitationRecord(page=5)])
-    'You can read that on page 5.'
-    >>> build_spoken_citation([CitationRecord(page=2), CitationRecord(page=7)])
-    'You can read that on pages 2 and 7.'
+    >>> build_spoken_citation([CitationRecord(source="book.pdf", page=5)])
+    'You can read that in book.pdf on page 5.'
     """
-    pages = sorted({c.page for c in citations if isinstance(c.page, int) and c.page > 0})
-    if not pages:
+    if not citations:
         return ""
+    first = citations[0]
+    source = first.source
+    pages = sorted(
+        {
+            citation.page
+            for citation in citations
+            if citation.source == source
+            and isinstance(citation.page, int)
+            and citation.page > 0
+        }
+    )
+    if not pages:
+        return f"You can read that in {source}."
     if len(pages) == 1:
-        return f"You can read that on page {pages[0]}."
-    return f"You can read that on pages {pages[0]} and {pages[1]}."
+        return f"You can read that in {source} on page {pages[0]}."
+    return f"You can read that in {source} on pages {pages[0]} and {pages[1]}."
 
 
 def validate_attributed_answer(obj: AttributedAnswer) -> None:
@@ -151,4 +163,8 @@ def validate_attributed_answer(obj: AttributedAnswer) -> None:
             "AttributedAnswer.citations must be non-empty for a grounded answer "
             "(refused=False and answer is not the TROUBLE fallback). "
             "If the answer is genuinely ungrounded, set refused=True."
+        )
+    elif any(not citation.source.strip() for citation in obj.citations):
+        raise ValueError(
+            "Every grounded citation must include a non-empty source identity."
         )

@@ -12,9 +12,12 @@ Contract shape (version 1)
     {
         "programme_id": "programme-demo-001",
         "course_id":     "course-demo-001",
-        "plan_version":  "v1",
+        "plan_version":  1,
         "week":          1,
-        "lecture_id":    "lecture-week-1"
+        "lecture_id":    "lecture-week-1",
+        "segments": [
+            {"order": 1, "slide": 0, "text": "Welcome to the lecture."}
+        ]
     }
 
 Unknown extra keys are ignored (forward-compatible).
@@ -50,7 +53,14 @@ from runtime import RuntimeMode, runtime_mode
 METADATA_SCHEMA_VERSION = "1"
 
 # Canonical field names — defined here so tests and validation share one source.
-_REQUIRED_FIELDS = ("programme_id", "course_id", "plan_version", "week", "lecture_id")
+_REQUIRED_FIELDS = (
+    "programme_id",
+    "course_id",
+    "plan_version",
+    "week",
+    "lecture_id",
+    "segments",
+)
 
 
 class SessionMetadataError(ValueError):
@@ -78,7 +88,7 @@ class LectureSessionMeta:
     lecture_id:
         Identifier of the specific lecture (e.g. ``"lecture-week-1"``).
     plan_version:
-        Approved curriculum plan version (e.g. ``"v1"``).
+        Approved curriculum plan version (e.g. ``1``).
     week:
         1-indexed week number within the course.
     sid:
@@ -89,8 +99,9 @@ class LectureSessionMeta:
     programme_id: str
     course_id: str
     lecture_id: str
-    plan_version: str
+    plan_version: int
     week: int
+    segments: tuple[dict[str, int | str], ...]
     sid: str = ""
 
     # ---------------------------------------------------------------------- #
@@ -165,12 +176,26 @@ class LectureSessionMeta:
                 field="week",
             )
 
+        plan_version = data["plan_version"]
+        if (
+            isinstance(plan_version, bool)
+            or not isinstance(plan_version, int)
+            or plan_version < 1
+        ):
+            raise SessionMetadataError(
+                "roomMetadata.plan_version must be a positive integer.",
+                field="plan_version",
+            )
+
+        segments = _validate_segments(data["segments"])
+
         return cls(
             programme_id=data["programme_id"].strip(),
             course_id=data["course_id"].strip(),
             lecture_id=data["lecture_id"].strip(),
-            plan_version=data["plan_version"].strip(),
+            plan_version=plan_version,
             week=week,
+            segments=segments,
             sid=effective_sid,
         )
 
@@ -196,8 +221,15 @@ class LectureSessionMeta:
             programme_id="programme-demo-001",
             course_id="course-demo-001",
             lecture_id="lecture-week-1",
-            plan_version="v1",
+            plan_version=1,
             week=1,
+            segments=(
+                {
+                    "order": 1,
+                    "slide": 0,
+                    "text": "Standalone fixture lecture segment.",
+                },
+            ),
             sid=sid,
         )
 
@@ -235,11 +267,11 @@ def _validate_fields(data: dict, mode: RuntimeMode) -> None:
     (the caller should use ``standalone_fixture()`` to skip validation).
     """
     for field in _REQUIRED_FIELDS:
-        if field == "week":
-            # week is validated separately because it is an int.
-            if "week" not in data:
+        if field in {"week", "plan_version", "segments"}:
+            if field not in data:
                 raise SessionMetadataError(
-                    "roomMetadata is missing required field 'week'.", field="week"
+                    f"roomMetadata is missing required field '{field}'.",
+                    field=field,
                 )
             continue
         value = data.get(field)
@@ -255,6 +287,46 @@ def _validate_fields(data: dict, mode: RuntimeMode) -> None:
             )
 
 
+def _validate_segments(value: object) -> tuple[dict[str, int | str], ...]:
+    if not isinstance(value, list) or not value:
+        raise SessionMetadataError(
+            "roomMetadata.segments must be a non-empty array.",
+            field="segments",
+        )
+
+    validated: list[dict[str, int | str]] = []
+    for index, segment in enumerate(value, start=1):
+        if not isinstance(segment, dict):
+            raise SessionMetadataError(
+                f"roomMetadata.segments[{index - 1}] must be an object.",
+                field="segments",
+            )
+        order = segment.get("order")
+        slide = segment.get("slide")
+        text = segment.get("text")
+        if (
+            isinstance(order, bool)
+            or not isinstance(order, int)
+            or order != index
+        ):
+            raise SessionMetadataError(
+                "roomMetadata.segments must use contiguous 1-based order values.",
+                field="segments",
+            )
+        if isinstance(slide, bool) or not isinstance(slide, int) or slide < 0:
+            raise SessionMetadataError(
+                f"roomMetadata.segments[{index - 1}].slide must be a non-negative integer.",
+                field="segments",
+            )
+        if not isinstance(text, str) or not text.strip():
+            raise SessionMetadataError(
+                f"roomMetadata.segments[{index - 1}].text must be non-empty.",
+                field="segments",
+            )
+        validated.append({"order": order, "slide": slide, "text": text.strip()})
+    return tuple(validated)
+
+
 # --------------------------------------------------------------------------- #
 # Canonical fixture metadata string (used in tests and simulator)              #
 # --------------------------------------------------------------------------- #
@@ -263,9 +335,16 @@ STANDALONE_ROOM_METADATA: str = json.dumps(
     {
         "programme_id": "programme-demo-001",
         "course_id": "course-demo-001",
-        "plan_version": "v1",
+        "plan_version": 1,
         "week": 1,
         "lecture_id": "lecture-week-1",
+        "segments": [
+            {
+                "order": 1,
+                "slide": 0,
+                "text": "Standalone fixture lecture segment.",
+            }
+        ],
         "_schema_version": METADATA_SCHEMA_VERSION,
     },
     separators=(",", ":"),

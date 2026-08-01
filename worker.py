@@ -104,11 +104,20 @@ class Lecture:
     audio_rate: int | None = None
 
     @staticmethod
-    def load(sid: str, week: int) -> "Lecture":
+    def load(
+        sid: str,
+        week: int,
+        ordered_segments: tuple[dict[str, int | str], ...] | None = None,
+    ) -> "Lecture":
         # Per-student course on disk: lectures/<studentId>/week-N/.
         folder = LECTURES_DIR / sid / f"week-{week}"
         script = json.loads((folder / "script.json").read_text("utf-8"))
-        lecture = Lecture(week=week, title=script["title"], segments=script["segments"], sid=sid)
+        segments = (
+            [dict(segment) for segment in ordered_segments]
+            if ordered_segments
+            else script["segments"]
+        )
+        lecture = Lecture(week=week, title=script["title"], segments=segments, sid=sid)
         meta = folder / "audio" / "meta.json"
         if meta.exists():
             lecture.audio_dir = folder / "audio"
@@ -399,7 +408,7 @@ class LectureSession:
             question, lecture_id=None, sid=self.lecture.sid, on_progress=on_progress,
             programme_id=scope.get("programme_id", ""),
             course_id=scope.get("course_id", ""),
-            plan_version=scope.get("plan_version", ""),
+            plan_version=scope.get("plan_version"),
             lecture_id_str=scope.get("lecture_id", ""),
         )
         await self.send({"type": "progress", "stage": "speaking", "detail": ""})
@@ -593,32 +602,36 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     from protocol import parse_room_name
 
     sid, week = parse_room_name(ctx.room.name)
-    lecture = Lecture.load(sid, week)
-    print(f"[lecture] {sid} week {week}: {lecture.title} ({len(lecture.segments)} segments)")
 
     # Parse extended session metadata from roomMetadata (App → Live contract).
-    # A missing or invalid blob is logged and reported to the room but does NOT
-    # stop the lecture — citations degrade to page-only (scope fields are empty).
-    session_meta: LectureSessionMeta | None = None
     raw_meta = getattr(ctx.room, "metadata", None) or ""
     try:
         session_meta = LectureSessionMeta.from_room_metadata(
             ctx.room.name, raw_meta, sid=sid
         )
+        if session_meta.week != week:
+            raise SessionMetadataError(
+                "roomMetadata.week does not match the LiveKit room name.",
+                field="week",
+            )
         print(
             f"[lecture] session metadata: programme={session_meta.programme_id} "
             f"course={session_meta.course_id} plan={session_meta.plan_version}"
         )
     except SessionMetadataError as exc:
-        print(f"[lecture] WARNING: {exc} (field={exc.field!r}) — citations will lack scope")
+        print(f"[lecture] ERROR: {exc} (field={exc.field!r})")
         await ctx.room.local_participant.publish_data(
             json.dumps({
                 "type": "progress",
                 "stage": "problem",
-                "detail": f"session metadata missing field '{exc.field}' — citations degraded",
+                "detail": f"Invalid lecture session metadata ({exc.field}): {exc}",
             }).encode("utf-8"),
             reliable=True,
         )
+        return
+
+    lecture = Lecture.load(sid, week, session_meta.segments)
+    print(f"[lecture] {sid} week {week}: {lecture.title} ({len(lecture.segments)} segments)")
 
     session = LectureSession(ctx.room, lecture, ctx.proc.userdata["tts"], session_meta)
     prompts_rate = ctx.proc.userdata.get("prompts_rate")
