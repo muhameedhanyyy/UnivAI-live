@@ -54,6 +54,7 @@ from common.sentences import split_sentences  # noqa: E402
 from protocols.lecture_session import LectureSessionMeta, SessionMetadataError  # noqa: E402
 from qa import TROUBLE, answer_question  # noqa: E402
 from tts import load_live_engine  # noqa: E402
+from prompt_cache import PromptCache  # noqa: E402
 from resilience.fallbacks import choose_fallback  # noqa: E402
 from resilience.timeouts import Stage, StageTimeout, within_budget  # noqa: E402
 
@@ -575,30 +576,20 @@ def prewarm(proc: agents.JobProcess) -> None:
         engine = None
     proc.userdata["tts"] = engine
 
-    # The raise-hand prompts, personalized, SAME voice as the lecture. Disk
-    # first (prerender_audio.py wrote them); render only if they are missing.
+    # Generic prompts contain no learner data. Personalized clips are loaded
+    # per authenticated session from PromptCache below.
     prompts: dict[str, np.ndarray] = {}
     rate = engine.sample_rate if engine else 24000
-    prompts_dir = LECTURES_DIR / "_prompts"
-    meta = prompts_dir / "meta.json"
-    if meta.exists():
-        rate = int(json.loads(meta.read_text("utf-8"))["sample_rate"])
-        for key in ("ask", "remind", "resume"):
-            path = prompts_dir / f"{key}.npy"
-            if path.exists():
-                prompts[key] = np.load(path)
-        print(f"[lecture] raise-hand prompts loaded from disk ({len(prompts)})")
-    elif engine is not None:
-        student = os.getenv("STUDENT_NAME", "there")
+    if engine is not None:
         prompt_texts = {
-            "ask": f"Yes, {student}? Do you have a question? Unmute your microphone and go ahead.",
-            "remind": f"{student}, your hand is still raised. Unmute whenever you are ready, I am listening.",
+            "ask": "Yes? Do you have a question? Unmute your microphone and go ahead.",
+            "remind": "Your hand is still raised. Unmute whenever you are ready; I am listening.",
             "resume": "No question? No problem. Alright everyone, eyes back on the slides, and let us continue!",
         }
         prompts = {key: engine.render(text) for key, text in prompt_texts.items()}
-        print(f"[lecture] raise-hand prompts rendered for '{student}'")
     proc.userdata["prompts"] = prompts
     proc.userdata["prompts_rate"] = rate
+    proc.userdata["prompt_cache"] = PromptCache(Path(os.getenv("PROMPT_CACHE_DIR", str(Path(__file__).parent / ".prompt-cache"))))
 
     from faster_whisper import WhisperModel
 
@@ -663,9 +654,23 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     session = LectureSession(ctx.room, lecture, ctx.proc.userdata["tts"], session_meta)
     prompts_rate = ctx.proc.userdata.get("prompts_rate")
+    prompt_bank = ctx.proc.userdata["prompts"]
+    try:
+        signed = json.loads(raw_meta)
+        display_name = signed.get("display_name")
+        engine = ctx.proc.userdata.get("tts")
+        if isinstance(display_name, str) and engine is not None:
+            prompt_bank, cached_rate = ctx.proc.userdata["prompt_cache"].load(
+                learner_id=sid, display_name=display_name, language="en",
+                voice=str(getattr(engine, "voice", "default")), model=engine.name,
+                model_version=str(getattr(engine, "model_version", "1")), generic=prompt_bank,
+            )
+            prompts_rate = cached_rate or prompts_rate
+    except (ValueError, TypeError):
+        prompt_bank = ctx.proc.userdata["prompts"]
     session.prompts = {
         key: session._fit(audio, prompts_rate)
-        for key, audio in ctx.proc.userdata["prompts"].items()
+        for key, audio in prompt_bank.items()
     }
     stt_model = ctx.proc.userdata["stt"]
 
