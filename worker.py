@@ -57,6 +57,7 @@ from tts import load_live_engine  # noqa: E402
 from prompt_cache import PromptCache  # noqa: E402
 from startup import ArtifactIndex, LazyDependencies, StartupStage, StartupTrace  # noqa: E402
 from telemetry.startup_metrics import append_trace  # noqa: E402
+from question_turn import QuestionTurnController, TurnState  # noqa: E402
 from resilience.fallbacks import choose_fallback  # noqa: E402
 from resilience.timeouts import Stage, StageTimeout, within_budget  # noqa: E402
 
@@ -171,6 +172,8 @@ class LectureSession:
         self.heard: asyncio.Queue[str] = asyncio.Queue()
         # What the student actually confirmed (possibly edited). "" means they cancelled.
         self.confirmed: asyncio.Queue[str] = asyncio.Queue()
+        self.question_turn = QuestionTurnController()
+        self.flush_capture = None
         self.speaking = False
         self.closed = False          # the student left; stop talking to an empty room
 
@@ -361,6 +364,8 @@ class LectureSession:
         the hand and pull the class back with the resume line.
         """
         self.hand_raised.clear()
+        if self.question_turn.start() is None:
+            return
 
         await self.send({"type": "state", "state": "asking"})
         if "ask" in self.prompts:
@@ -375,11 +380,15 @@ class LectureSession:
 
         answered = False
         if unmuted:
+            self.question_turn.listen()
             self.hand_active = True
             try:
                 answered = await self.collect_and_answer()
             finally:
                 self.hand_active = False
+
+        if not answered and self.question_turn.state is not TurnState.CLOSED:
+            await self.question_turn.close("no_speech" if unmuted else "unmute_timeout")
 
         await self.send({"type": "hand", "state": "lowered"})
         if not answered and "resume" in self.prompts:
@@ -391,23 +400,29 @@ class LectureSession:
         Returns False when nothing was ultimately asked."""
         await self.send({"type": "state", "state": "listening"})
 
-        try:
-            heard = await asyncio.wait_for(self.heard.get(), timeout=20)
-        except asyncio.TimeoutError:
-            # They unmuted but never actually asked anything. Carry on.
+        while not self.question_turn.review_ready.is_set():
+            reason = self.question_turn.endpoint_reason()
+            if reason:
+                await self.question_turn.finalize(reason)
+                break
+            await asyncio.sleep(0.05)
+        if self.question_turn.state is not TurnState.REVIEW:
+            await self.send({"type": "progress", "stage": "problem", "detail": "No complete question was captured. Please raise your hand and try again."})
             return False
+        heard = self.question_turn.transcript or ""
 
         # Nothing is asked on the student's behalf. We show them what we heard and
         # they send it, edit it first, or throw it away.
         await self.send({"type": "state", "state": "review"})
         await self.send({"type": "transcript", "text": heard})
-        log(f"[lecture] heard: {heard!r} - waiting for the student to confirm")
+        log(f"[question-turn] stage=review turn_id={self.question_turn.turn_id}")
 
         try:
             question = await asyncio.wait_for(self.confirmed.get(), timeout=REVIEW_TIMEOUT_S)
         except asyncio.TimeoutError:
             print("[lecture] no confirmation - resuming the lecture")
             await self.send({"type": "transcript", "text": None})
+            await self.question_turn.close("review_timeout")
             return False
 
         if not question.strip():          # they cancelled
@@ -420,7 +435,7 @@ class LectureSession:
         self.hand_active = False
 
         await self.send({"type": "state", "state": "answering"})
-        log(f"[lecture] question: {question}")
+        log(f"[question-turn] stage=answering turn_id={self.question_turn.turn_id}")
 
         async def on_progress(stage: str, detail: str) -> None:
             log(f"[qa] {stage}: {detail}" if detail else f"[qa] {stage}")
@@ -492,6 +507,7 @@ class LectureSession:
                 f"[speak] sentence {index + 1}/{total}: waited {waited:.2f}s on TTS, "
                 f"{speech:.1f}s of speech played in {played:.2f}s"
             )
+        await self.question_turn.close("completed")
         return True
 
 
@@ -517,6 +533,30 @@ async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model) ->
     # Adaptive threshold: a fixed 0.02 RMS misses quiet microphones entirely.
     # Track the noise floor and trigger a few times above it instead.
     noise_floor = 0.004
+
+    async def transcribe(audio: np.ndarray) -> str:
+        resolved_model = await session.dependencies.stt() if session.dependencies else model
+        if resolved_model is None:
+            return ""
+        def run_stt() -> str:
+            segments, _info = resolved_model.transcribe(audio, language="en")
+            return " ".join(seg.text.strip() for seg in segments).strip()
+        try:
+            return await within_budget(Stage.STT, asyncio.to_thread(run_stt))
+        except StageTimeout:
+            await session.send(choose_fallback("stt", "stt_timeout").event())
+            return ""
+
+    async def flush_segment() -> None:
+        nonlocal buffer, capturing, speech_ms
+        if not buffer or not session.question_turn.turn_id:
+            return
+        audio = np.concatenate(buffer)
+        buffer, capturing, speech_ms = [], False, 0
+        preroll.clear()
+        session.question_turn.add_stt(session.question_turn.turn_id, transcribe(audio))
+
+    session.flush_capture = flush_segment
 
     async for event in stream:
         frame = event.frame
@@ -544,6 +584,9 @@ async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model) ->
             buffer, capturing, speech_ms = [], False, 0
             continue
 
+        if loud:
+            session.question_turn.observe_speech()
+
         if not capturing:
             preroll.append(samples)
 
@@ -556,30 +599,13 @@ async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model) ->
             buffer.append(samples)
 
             if silence_ms >= SILENCE_END_MS:
-                audio = np.concatenate(buffer) if buffer else np.zeros(1, dtype=np.float32)
-                buffer, capturing, speech_ms, silence_ms = [], False, 0, 0
-                preroll.clear()
+                await flush_segment()
 
-                if session.dependencies:
-                    model = await session.dependencies.stt()
-
-                def run_stt(samples: np.ndarray) -> str:
-                    segments, _info = model.transcribe(samples, language="en")
-                    return " ".join(seg.text.strip() for seg in segments).strip()
-
-                stt_started = time.perf_counter()
-                try:
-                    text = await within_budget(Stage.STT, asyncio.to_thread(run_stt, audio))
-                except StageTimeout:
-                    fallback = choose_fallback("stt", "stt_timeout")
-                    await session.send(fallback.event())
-                    text = ""
-                log(
-                    f"[listener] STT of {len(audio) / 16000:.1f}s audio took "
-                    f"{time.perf_counter() - stt_started:.2f}s"
-                )
-                if text:
-                    await session.heard.put(text)
+        reason = session.question_turn.endpoint_reason()
+        if reason:
+            if buffer:
+                await flush_segment()
+            await session.question_turn.finalize(reason)
 
         if not capturing and silence_ms > 1000:
             speech_ms = 0
@@ -711,22 +737,49 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     @ctx.room.on("data_received")
     def on_data(packet: rtc.DataPacket) -> None:
         # The student pressed Send (possibly after editing) or Cancel.
+        participant = getattr(packet, "participant", None)
+        if participant is not None and getattr(participant, "identity", sid) != sid:
+            return
         try:
             message = json.loads(packet.data.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return
         if message.get("type") == "question":
-            session.confirmed.put_nowait(str(message.get("text", "")))
+            confirmed = session.question_turn.confirm(str(message.get("text", "")))
+            if confirmed is not None:
+                session.confirmed.put_nowait(confirmed)
         elif message.get("type") == "cancel":
-            session.confirmed.put_nowait("")
+            async def cancel_review() -> None:
+                if await session.question_turn.cancel():
+                    session.confirmed.put_nowait("")
+            asyncio.create_task(cancel_review())
         elif message.get("type") == "raise_hand":
+            if session.question_turn.state not in {TurnState.IDLE, TurnState.CLOSED}:
+                session.question_turn.start()
+                return
             log("[lecture] hand raised")
             session.hand_raised.set()
         elif message.get("type") == "mic":
             if message.get("muted"):
                 session.mic_unmuted.clear()
+                session.question_turn.request_mute()
+                turn_id = session.question_turn.turn_id
+                async def finalize_after_drain() -> None:
+                    await asyncio.sleep(session.question_turn.config.mute_drain_ms / 1000)
+                    if turn_id != session.question_turn.turn_id or session.question_turn.state is not TurnState.LISTENING:
+                        return
+                    if session.flush_capture:
+                        await session.flush_capture()
+                    reason = session.question_turn.endpoint_reason()
+                    if reason == "mic_muted":
+                        await session.question_turn.finalize(reason)
+                asyncio.create_task(finalize_after_drain())
             else:
                 session.mic_unmuted.set()
+
+    @ctx.room.on("disconnected")
+    def on_disconnected(*_: object) -> None:
+        asyncio.create_task(session.question_turn.close("disconnect"))
 
     await session.run()
 
