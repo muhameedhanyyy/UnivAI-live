@@ -73,3 +73,8 @@ integrated environment.
 This directory is a Git submodule. Merge Live changes in its own repository
 first, then update the main UnivAI gitlink. Local submodule file changes are
 not automatically included in a main-repository commit.
+## Raised-hand endpointing
+
+Question capture keeps the 800 ms pause as an STT segment boundary and joins every turn-scoped segment before review. A turn ends after 2,500 ms final silence or 300 ms after mute, with 30 s to first speech and a 45 s duration bound. Override only with validated `QUESTION_SEGMENT_MS`, `QUESTION_FINAL_SILENCE_MS`, `QUESTION_MUTE_DRAIN_MS`, `QUESTION_FIRST_SPEECH_MS`, and `QUESTION_MAX_DURATION_MS`; invalid bounds fail startup.
+
+Real acceptance requires a configured LiveKit room and microphone: ask a covered multi-pause question ten times, cancel a fragmented turn before asking another, and verify one complete editable transcript and exactly one grounded retrieval per confirmed turn. Unit tests use fake clocks and are not evidence of microphone behavior.
