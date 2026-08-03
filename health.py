@@ -22,7 +22,7 @@ def dependency_health() -> list[DependencyHealth]:
         _endpoint("livekit", os.getenv("LIVEKIT_URL")),
         _model("stt", os.getenv("STT_MODEL_PATH"), allow_named=os.getenv("STT_MODEL_SIZE")),
         _model("tts", os.getenv("KOKORO_MODEL") or os.getenv("PIPER_MODEL")),
-        _endpoint("agent", os.getenv("RAG_URL") or os.getenv("AGENT_URL")),
+        _endpoint("agent", os.getenv("RAG_MCP_URL") or os.getenv("RAG_URL") or os.getenv("AGENT_URL")),
     ]
 
 

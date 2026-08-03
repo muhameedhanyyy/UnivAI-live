@@ -52,7 +52,7 @@ from livekit import agents, rtc
 from common.device import whisper_settings, describe  # noqa: E402
 from common.sentences import split_sentences  # noqa: E402
 from protocols.lecture_session import LectureSessionMeta, SessionMetadataError  # noqa: E402
-from qa import answer_question  # noqa: E402
+from qa import TROUBLE, answer_question  # noqa: E402
 from tts import load_live_engine  # noqa: E402
 from resilience.fallbacks import choose_fallback  # noqa: E402
 from resilience.timeouts import Stage, StageTimeout, within_budget  # noqa: E402
@@ -411,13 +411,21 @@ class LectureSession:
         # scope. Falls back to empty strings when session_meta was not available
         # (only possible in standalone mode where worker.py is not used).
         scope = self.session_meta.as_citation_scope() if self.session_meta else {}
-        result = await answer_question(
-            question, lecture_id=None, sid=self.lecture.sid, on_progress=on_progress,
-            programme_id=scope.get("programme_id", ""),
-            course_id=scope.get("course_id", ""),
-            plan_version=scope.get("plan_version"),
-            lecture_id_str=scope.get("lecture_id", ""),
-        )
+        try:
+            result = await within_budget(
+                Stage.TOTAL,
+                answer_question(
+                    question, lecture_id=None, sid=self.lecture.sid, on_progress=on_progress,
+                    programme_id=scope.get("programme_id", ""),
+                    course_id=scope.get("course_id", ""),
+                    plan_version=scope.get("plan_version"),
+                    lecture_id_str=scope.get("lecture_id", ""),
+                ),
+            )
+        except StageTimeout:
+            fallback = choose_fallback("agent", "total_qa_timeout")
+            await self.send(fallback.event())
+            result = {"answer": TROUBLE, "pages": [], "citations": []}
         await self.send({"type": "progress", "stage": "speaking", "detail": ""})
 
         await self.send(
