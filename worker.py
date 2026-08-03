@@ -55,6 +55,8 @@ from protocols.lecture_session import LectureSessionMeta, SessionMetadataError  
 from qa import TROUBLE, answer_question  # noqa: E402
 from tts import load_live_engine  # noqa: E402
 from prompt_cache import PromptCache  # noqa: E402
+from startup import ArtifactIndex, LazyDependencies, StartupStage, StartupTrace  # noqa: E402
+from telemetry.startup_metrics import append_trace  # noqa: E402
 from resilience.fallbacks import choose_fallback  # noqa: E402
 from resilience.timeouts import Stage, StageTimeout, within_budget  # noqa: E402
 
@@ -138,7 +140,7 @@ class Lecture:
 
 
 class LectureSession:
-    def __init__(self, room: rtc.Room, lecture: Lecture, tts, session_meta: LectureSessionMeta | None = None) -> None:
+    def __init__(self, room: rtc.Room, lecture: Lecture, tts, session_meta: LectureSessionMeta | None = None, *, startup_trace: StartupTrace | None = None, startup_mode: str = "warm", dependencies: LazyDependencies | None = None) -> None:
         self.room = room
         self.lecture = lecture
         self.session_meta = session_meta
@@ -147,6 +149,10 @@ class LectureSession:
         # need the on-demand Piper fallback in _engine().
         self.tts = tts
         self._engine_retry = False
+        self.startup_trace = startup_trace
+        self.startup_mode = startup_mode
+        self.dependencies = dependencies
+        self._first_frame_recorded = False
 
         # Engines differ: Piper is 22.05 kHz, XTTS is 24 kHz. Publishing at the
         # wrong rate does not fail — it just makes the lecturer sound wrong.
@@ -197,10 +203,7 @@ class LectureSession:
         if self.tts is None and not self._engine_retry:
             self._engine_retry = True
             try:
-                from tts import PiperTTS
-
-                self.tts = await asyncio.to_thread(PiperTTS)
-                print("[tts] Piper loaded on demand for live speech")
+                self.tts = await self.dependencies.tts() if self.dependencies else None
             except Exception as exc:
                 print(f"[tts] no live engine available: {exc}")
         return self.tts
@@ -248,6 +251,16 @@ class LectureSession:
                 )
                 try:
                     await self.source.capture_frame(frame)
+                    if not self._first_frame_recorded and self.startup_trace:
+                        self._first_frame_recorded = True
+                        self.startup_trace.mark(StartupStage.FIRST_FRAME)
+                        payload = self.startup_trace.payload(mode=self.startup_mode)
+                        print(json.dumps(payload, sort_keys=True), flush=True)
+                        trace_path = os.getenv("STARTUP_TRACE_PATH")
+                        if trace_path:
+                            append_trace(Path(trace_path), payload)
+                        if self.dependencies:
+                            asyncio.create_task(self.dependencies.warm())
                 except Exception as exc:
                     # The student closed the tab mid-sentence. Stop talking to an
                     # empty room rather than crashing the worker.
@@ -264,11 +277,16 @@ class LectureSession:
     # -- the state machine ------------------------------------------------------
 
     async def run(self) -> None:
-        await self.room.local_participant.publish_track(self.track)
+        timeout = self.startup_trace.remaining() if self.startup_trace else 8.0
+        await asyncio.wait_for(self.room.local_participant.publish_track(self.track), timeout=timeout)
+        if self.startup_trace:
+            self.startup_trace.mark(StartupStage.TRACK_PUBLISHED)
         # Honesty first: the voice models may still be loading, and claiming
         # "speaking" over silence reads as a broken page. The room shows
         # "preparing" until the first sentence's audio actually exists.
         await self.send({"type": "state", "state": "preparing"})
+        if self.startup_trace:
+            self.startup_trace.mark(StartupStage.READY_ACKNOWLEDGED)
 
         segments = self.lecture.segments
         position = self.lecture.position
@@ -542,6 +560,9 @@ async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model) ->
                 buffer, capturing, speech_ms, silence_ms = [], False, 0, 0
                 preroll.clear()
 
+                if session.dependencies:
+                    model = await session.dependencies.stt()
+
                 def run_stt(samples: np.ndarray) -> str:
                     segments, _info = model.transcribe(samples, language="en")
                     return " ".join(seg.text.strip() for seg in segments).strip()
@@ -569,12 +590,11 @@ def prewarm(proc: agents.JobProcess) -> None:
 
     Every piece here is allowed to fail: lectures play from disk, prompts come
     pre-rendered from disk, and a missing engine only degrades live answers."""
-    try:
-        engine = load_live_engine()
-    except Exception as exc:
-        print(f"[tts] engine failed to load ({exc}) - lecture audio comes from disk")
-        engine = None
-    proc.userdata["tts"] = engine
+    engine = None
+    proc.userdata["tts"] = None
+    proc.userdata["dependencies"] = LazyDependencies()
+    proc.userdata["artifact_index"] = ArtifactIndex(LECTURES_DIR)
+    proc.userdata["startup_count"] = 0
 
     # Generic prompts contain no learner data. Personalized clips are loaded
     # per authenticated session from PromptCache below.
@@ -591,21 +611,13 @@ def prewarm(proc: agents.JobProcess) -> None:
     proc.userdata["prompts_rate"] = rate
     proc.userdata["prompt_cache"] = PromptCache(Path(os.getenv("PROMPT_CACHE_DIR", str(Path(__file__).parent / ".prompt-cache"))))
 
-    from faster_whisper import WhisperModel
-
-    stt_device, compute_type = whisper_settings()
-    try:
-        model = WhisperModel(STT_MODEL_SIZE, device=stt_device, compute_type=compute_type)
-        print(f"[listener] faster-whisper '{STT_MODEL_SIZE}' on {describe()} ({compute_type})")
-    except Exception as exc:
-        # CUDA whisper needs cuDNN; fall back rather than leave the room deaf.
-        print(f"[listener] {stt_device} unavailable ({exc}); using CPU")
-        model = WhisperModel(STT_MODEL_SIZE, device="cpu", compute_type="int8")
-    proc.userdata["stt"] = model
+    proc.userdata["stt"] = None
 
 
 async def entrypoint(ctx: agents.JobContext) -> None:
-    await ctx.connect()
+    trace = StartupTrace()
+    await asyncio.wait_for(ctx.connect(), timeout=trace.remaining())
+    trace.mark(StartupStage.ROOM_CONNECTED)
 
     raw_meta = getattr(ctx.room, "metadata", None) or ""
     try:
@@ -613,7 +625,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     except (ValueError, AttributeError):
         metadata_kind = None
     if metadata_kind == "univai.section-session-meta":
-        await _run_section(ctx, raw_meta)
+        await _run_section(ctx, raw_meta, trace)
         return
 
     # Room names are lecture-<studentId>-week-N (the app's token route mints
@@ -633,6 +645,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 "roomMetadata.week does not match the LiveKit room name.",
                 field="week",
             )
+        trace.mark(StartupStage.METADATA_VALID)
         print(
             f"[lecture] session metadata: programme={session_meta.programme_id} "
             f"course={session_meta.course_id} plan={session_meta.plan_version}"
@@ -649,21 +662,37 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         )
         return
 
-    lecture = Lecture.load(sid, week, session_meta.segments)
+    try:
+        ctx.proc.userdata["artifact_index"].require(sid, week)
+        lecture = Lecture.load(sid, week, session_meta.segments)
+        trace.mark(StartupStage.ARTIFACT_LOADED)
+    except (OSError, ValueError) as exc:
+        await ctx.room.local_participant.publish_data(json.dumps({
+            "type": "progress", "stage": "problem", "detail": str(exc),
+        }).encode(), reliable=True)
+        return
     print(f"[lecture] {sid} week {week}: {lecture.title} ({len(lecture.segments)} segments)")
 
-    session = LectureSession(ctx.room, lecture, ctx.proc.userdata["tts"], session_meta)
+    count = ctx.proc.userdata["startup_count"]
+    ctx.proc.userdata["startup_count"] = count + 1
+    session = LectureSession(
+        ctx.room, lecture, ctx.proc.userdata["tts"], session_meta,
+        startup_trace=trace, startup_mode="cold" if count == 0 else "warm",
+        dependencies=ctx.proc.userdata["dependencies"],
+    )
     prompts_rate = ctx.proc.userdata.get("prompts_rate")
     prompt_bank = ctx.proc.userdata["prompts"]
     try:
         signed = json.loads(raw_meta)
         display_name = signed.get("display_name")
         engine = ctx.proc.userdata.get("tts")
-        if isinstance(display_name, str) and engine is not None:
+        if isinstance(display_name, str):
             prompt_bank, cached_rate = ctx.proc.userdata["prompt_cache"].load(
                 learner_id=sid, display_name=display_name, language="en",
-                voice=str(getattr(engine, "voice", "default")), model=engine.name,
-                model_version=str(getattr(engine, "model_version", "1")), generic=prompt_bank,
+                voice=str(getattr(engine, "voice", os.getenv("KOKORO_VOICE", "default"))),
+                model=str(getattr(engine, "name", os.getenv("TTS_ENGINE", "kokoro"))),
+                model_version=str(getattr(engine, "model_version", os.getenv("TTS_MODEL_VERSION", "1"))),
+                generic=prompt_bank,
             )
             prompts_rate = cached_rate or prompts_rate
     except (ValueError, TypeError):
@@ -702,7 +731,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     await session.run()
 
 
-async def _run_section(ctx: agents.JobContext, raw_meta: str) -> None:
+async def _run_section(ctx: agents.JobContext, raw_meta: str, trace: StartupTrace) -> None:
     """Minimal LiveKit adapter around the repository-local section controller."""
     from protocols.section_session import SectionContractError, SectionSessionMetaV1
     from section_controller import SectionController
@@ -711,6 +740,8 @@ async def _run_section(ctx: agents.JobContext, raw_meta: str) -> None:
     learner_id = prefix[len("section-") :] if separator and prefix.startswith("section-") else ""
     try:
         meta = SectionSessionMetaV1.from_room_metadata(raw_meta, authenticated_learner_id=learner_id)
+        trace.mark(StartupStage.METADATA_VALID)
+        trace.mark(StartupStage.ARTIFACT_LOADED)
     except SectionContractError as exc:
         await ctx.room.local_participant.publish_data(json.dumps({
             "type": "section_error", "schema_version": "1.0.0",
@@ -722,15 +753,35 @@ async def _run_section(ctx: agents.JobContext, raw_meta: str) -> None:
     sample_rate = engine.sample_rate if engine else 24000
     source = rtc.AudioSource(sample_rate, 1)
     track = rtc.LocalAudioTrack.create_audio_track("section-guide", source)
-    await ctx.room.local_participant.publish_track(track)
+    await asyncio.wait_for(ctx.room.local_participant.publish_track(track), timeout=trace.remaining())
+    trace.mark(StartupStage.TRACK_PUBLISHED)
+    await ctx.room.local_participant.publish_data(json.dumps({"type": "section_ready", "schema_version": "1.0.0"}).encode(), reliable=True)
+    trace.mark(StartupStage.READY_ACKNOWLEDGED)
+    first_content = False
 
     async def emit(event: dict) -> None:
+        nonlocal first_content
         await ctx.room.local_participant.publish_data(json.dumps(event).encode(), reliable=True)
+        if not first_content:
+            first_content = True
+            trace.mark(StartupStage.FIRST_FRAME)
+            count = ctx.proc.userdata["startup_count"]
+            ctx.proc.userdata["startup_count"] = count + 1
+            payload = trace.payload(mode="cold" if count == 0 else "warm")
+            print(json.dumps(payload, sort_keys=True), flush=True)
+            trace_path = os.getenv("STARTUP_TRACE_PATH")
+            if trace_path:
+                append_trace(Path(trace_path), payload)
+            asyncio.create_task(ctx.proc.userdata["dependencies"].warm())
 
     async def speak(text: str) -> None:
+        nonlocal engine
         if engine is None:
-            await emit(choose_fallback("tts", "tts_unavailable").event())
-            return
+            try:
+                engine = await ctx.proc.userdata["dependencies"].tts()
+            except Exception:
+                await emit(choose_fallback("tts", "tts_unavailable").event())
+                return
         try:
             audio = await within_budget(Stage.TTS, asyncio.to_thread(engine.render, text))
         except StageTimeout:
@@ -774,8 +825,8 @@ if __name__ == "__main__":
         agents.WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
-            # Prewarm loads Kokoro + Whisper and renders the raise-hand prompts;
-            # the SDK's default 10 s initialize timeout kills the process mid-load.
-            initialize_process_timeout=180.0,
+            # Lightweight indexing is bounded; models are deferred until after
+            # the first content frame has made the room visibly ready.
+            initialize_process_timeout=8.0,
         )
     )
