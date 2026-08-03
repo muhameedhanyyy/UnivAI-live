@@ -616,6 +616,15 @@ def prewarm(proc: agents.JobProcess) -> None:
 async def entrypoint(ctx: agents.JobContext) -> None:
     await ctx.connect()
 
+    raw_meta = getattr(ctx.room, "metadata", None) or ""
+    try:
+        metadata_kind = json.loads(raw_meta).get("schema_name")
+    except (ValueError, AttributeError):
+        metadata_kind = None
+    if metadata_kind == "univai.section-session-meta":
+        await _run_section(ctx, raw_meta)
+        return
+
     # Room names are lecture-<studentId>-week-N (the app's token route mints
     # them). rpartition on "-week-" is safe even though studentId itself
     # contains dashes (S-2026-000042).
@@ -624,7 +633,6 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     sid, week = parse_room_name(ctx.room.name)
 
     # Parse extended session metadata from roomMetadata (App → Live contract).
-    raw_meta = getattr(ctx.room, "metadata", None) or ""
     try:
         session_meta = LectureSessionMeta.from_room_metadata(
             ctx.room.name, raw_meta, sid=sid
@@ -687,6 +695,73 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 session.mic_unmuted.set()
 
     await session.run()
+
+
+async def _run_section(ctx: agents.JobContext, raw_meta: str) -> None:
+    """Minimal LiveKit adapter around the repository-local section controller."""
+    from protocols.section_session import SectionContractError, SectionSessionMetaV1
+    from section_controller import SectionController
+
+    prefix, separator, _week = ctx.room.name.rpartition("-week-")
+    learner_id = prefix[len("section-") :] if separator and prefix.startswith("section-") else ""
+    try:
+        meta = SectionSessionMetaV1.from_room_metadata(raw_meta, authenticated_learner_id=learner_id)
+    except SectionContractError as exc:
+        await ctx.room.local_participant.publish_data(json.dumps({
+            "type": "section_error", "schema_version": "1.0.0",
+            "payload": {"field": exc.field, "message": str(exc)},
+        }).encode(), reliable=True)
+        return
+
+    engine = ctx.proc.userdata.get("tts")
+    sample_rate = engine.sample_rate if engine else 24000
+    source = rtc.AudioSource(sample_rate, 1)
+    track = rtc.LocalAudioTrack.create_audio_track("section-guide", source)
+    await ctx.room.local_participant.publish_track(track)
+
+    async def emit(event: dict) -> None:
+        await ctx.room.local_participant.publish_data(json.dumps(event).encode(), reliable=True)
+
+    async def speak(text: str) -> None:
+        if engine is None:
+            await emit(choose_fallback("tts", "tts_unavailable").event())
+            return
+        try:
+            audio = await within_budget(Stage.TTS, asyncio.to_thread(engine.render, text))
+        except StageTimeout:
+            await emit(choose_fallback("tts", "tts_timeout").event())
+            return
+        for start in range(0, len(audio), sample_rate // 10):
+            pcm = (np.clip(audio[start : start + sample_rate // 10], -1, 1) * 32767).astype(np.int16)
+            await source.capture_frame(rtc.AudioFrame(data=pcm.tobytes(), sample_rate=sample_rate, num_channels=1, samples_per_channel=len(pcm)))
+
+    controller = SectionController(meta, emit, speak)
+    commands: asyncio.Queue[dict] = asyncio.Queue()
+
+    @ctx.room.on("data_received")
+    def on_section_data(packet: rtc.DataPacket) -> None:
+        participant = getattr(packet, "participant", None)
+        if participant is None or getattr(participant, "identity", "") != meta.learner_id:
+            return
+        try:
+            value = json.loads(packet.data.decode())
+        except (ValueError, UnicodeDecodeError):
+            return
+        if value.get("type") in {"section_submit", "todo_ack", "section_complete", "raise_hand"}:
+            commands.put_nowait(value)
+
+    await controller.start()
+    while not controller.completed:
+        command = await commands.get()
+        if command["type"] == "section_submit":
+            await controller.submit(str(command.get("submission_id", "")), activity_index=int(command.get("activity_index", -1)), text=str(command.get("text", "")))
+        elif command["type"] == "todo_ack":
+            await controller.acknowledge_todo(int(command.get("todo_index", -1)))
+        elif command["type"] == "raise_hand":
+            checkpoint = await controller.interrupt()
+            await controller.resume(checkpoint)
+        else:
+            await controller.complete()
 
 
 if __name__ == "__main__":
