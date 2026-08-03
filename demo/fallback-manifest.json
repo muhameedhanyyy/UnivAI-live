@@ -1,0 +1,9 @@
+{
+  "schema": "univai.live.demo-fallback",
+  "version": "1.0.0",
+  "recorded_fallback": {
+    "allowed_only_for_external_outage": true,
+    "must_be_disclosed_to_viewers": true,
+    "artifact": null
+  }
+}

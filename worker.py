@@ -54,6 +54,8 @@ from common.sentences import split_sentences  # noqa: E402
 from protocols.lecture_session import LectureSessionMeta, SessionMetadataError  # noqa: E402
 from qa import answer_question  # noqa: E402
 from tts import load_live_engine  # noqa: E402
+from resilience.fallbacks import choose_fallback  # noqa: E402
+from resilience.timeouts import Stage, StageTimeout, within_budget  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
@@ -208,7 +210,12 @@ class LectureSession:
         if engine is None:
             # Nothing can speak. The text still reaches the browser as data.
             return np.zeros(0, dtype=np.float32)
-        audio = await asyncio.to_thread(engine.render, text)
+        try:
+            audio = await within_budget(Stage.TTS, asyncio.to_thread(engine.render, text))
+        except StageTimeout:
+            fallback = choose_fallback("tts", "tts_timeout")
+            await self.send(fallback.event())
+            return np.zeros(0, dtype=np.float32)
         return self._fit(audio, engine.sample_rate)
 
     async def sentence_audio(self, segment: int, sentence: int, text: str) -> np.ndarray:
@@ -531,7 +538,12 @@ async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model) ->
                     return " ".join(seg.text.strip() for seg in segments).strip()
 
                 stt_started = time.perf_counter()
-                text = await asyncio.to_thread(run_stt, audio)
+                try:
+                    text = await within_budget(Stage.STT, asyncio.to_thread(run_stt, audio))
+                except StageTimeout:
+                    fallback = choose_fallback("stt", "stt_timeout")
+                    await session.send(fallback.event())
+                    text = ""
                 log(
                     f"[listener] STT of {len(audio) / 16000:.1f}s audio took "
                     f"{time.perf_counter() - stt_started:.2f}s"
