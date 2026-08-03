@@ -23,6 +23,22 @@ from common.rag_client import search_book, RagUnavailable  # noqa: E402
 from citations import enrich_citations  # noqa: E402
 from resilience.fallbacks import choose_fallback  # noqa: E402
 from resilience.timeouts import Stage, StageTimeout, within_budget  # noqa: E402
+from resilience.circuit_breaker import CircuitBreaker, CircuitOpen  # noqa: E402
+from resilience.timeouts import retry_bounded  # noqa: E402
+
+_RAG_BREAKER = CircuitBreaker()
+_LLM_BREAKER = CircuitBreaker()
+
+
+async def _protected(breaker: CircuitBreaker, factory):
+    breaker.before_call()
+    try:
+        value = await retry_bounded(factory)
+    except Exception:
+        breaker.record_failure()
+        raise
+    breaker.record_success()
+    return value
 
 # Three short spoken sentences are ~60 tokens. The old uncapped call let the
 # model ramble to its 180-token default — well over a minute of SPOKEN speech
@@ -109,9 +125,9 @@ async def answer_question(
 
     try:
         await progress("retrieving", "")
-        hits = await within_budget(
-            Stage.RETRIEVAL_GENERATION,
-            search_book(question, top_k=5, user_id=sid),
+        hits = await _protected(
+            _RAG_BREAKER,
+            lambda: within_budget(Stage.RETRIEVAL_GENERATION, search_book(question, top_k=5, user_id=sid)),
         )
         await progress(
             "retrieved",
@@ -174,13 +190,13 @@ async def answer_question(
         # complete() is synchronous urllib; on the event loop it would freeze the
         # room (no audio, no data messages) for the whole generation. Keep the
         # QA timeout even with the cap set (a cap normally means "generation").
-        result = await within_budget(
-            Stage.RETRIEVAL_GENERATION,
-            asyncio.to_thread(complete, prompt, SYSTEM, ANSWER_MAX_TOKENS, None, TIMEOUT_QA_S),
+        result = await _protected(
+            _LLM_BREAKER,
+            lambda: within_budget(Stage.RETRIEVAL_GENERATION, asyncio.to_thread(complete, prompt, SYSTEM, ANSWER_MAX_TOKENS, None, TIMEOUT_QA_S)),
         )
         answer, model_used = result.text.strip(), result.model_used
         await progress("answered", f"{model_used} in {time.perf_counter() - llm_started:.1f}s")
-    except (LLMError, StageTimeout) as exc:
+    except (LLMError, StageTimeout, CircuitOpen, ConnectionError) as exc:
         # Both primary and fallback are down. Say something graceful and keep lecturing.
         print(f"[qa] all models failed: {exc}")
         await progress("problem", "both models failed - apologising and moving on")
