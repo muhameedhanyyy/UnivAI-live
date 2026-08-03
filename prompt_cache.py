@@ -8,9 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
-from typing import Callable
-
-import numpy as np
+from typing import Any, Callable
 
 from personalization import normalized_name_digest, render_templates
 from protocols.personalized_prompts import ClipRecord, PHRASE_SET_VERSION, PersonalizedPromptManifestV1
@@ -32,7 +30,7 @@ class PromptCache:
         model: str,
         model_version: str,
         sample_rate: int,
-        render: Callable[[str], np.ndarray],
+        render: Callable[[str], Any],
     ) -> PersonalizedPromptManifestV1:
         target = self._directory(learner_id, display_name, language, voice, model, model_version)
         existing = self._read_manifest(target)
@@ -41,6 +39,7 @@ class PromptCache:
         target.mkdir(parents=True, exist_ok=True)
         records: list[ClipRecord] = []
         for phrase_id, text in render_templates(display_name).items():
+            np = _numpy()
             audio = np.asarray(render(text), dtype=np.float32)
             if not audio.size or not np.isfinite(audio).all():
                 raise ValueError("renderer returned invalid audio")
@@ -71,13 +70,14 @@ class PromptCache:
         voice: str,
         model: str,
         model_version: str,
-        generic: dict[str, np.ndarray],
-    ) -> tuple[dict[str, np.ndarray], int | None]:
+        generic: dict[str, Any],
+    ) -> tuple[dict[str, Any], int | None]:
         target = self._directory(learner_id, display_name, language, voice, model, model_version)
         manifest = self._read_manifest(target)
         if manifest is None or not self._valid_clips(target, manifest):
             self.repair("personalized_prompt_cache_miss")
             return generic, None
+        np = _numpy()
         clips = {clip.phrase_id: np.load(target / clip.filename, allow_pickle=False) for clip in manifest.clips}
         return clips, manifest.sample_rate
 
@@ -107,6 +107,7 @@ class PromptCache:
 
     @staticmethod
     def _valid_clips(target: Path, manifest: PersonalizedPromptManifestV1) -> bool:
+        np = _numpy()
         try:
             for clip in manifest.clips:
                 if Path(clip.filename).name != clip.filename:
@@ -126,10 +127,16 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def _npy_bytes(audio: np.ndarray) -> bytes:
+def _npy_bytes(audio: Any) -> bytes:
+    np = _numpy()
     stream = io.BytesIO()
     np.save(stream, audio, allow_pickle=False)
     return stream.getvalue()
+
+
+def _numpy():
+    import numpy
+    return numpy
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:
