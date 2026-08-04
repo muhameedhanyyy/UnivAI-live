@@ -615,8 +615,13 @@ def prewarm(proc: agents.JobProcess) -> None:
 
     Every piece here is allowed to fail: lectures play from disk, prompts come
     pre-rendered from disk, and a missing engine only degrades live answers."""
-    engine = None
-    proc.userdata["tts"] = None
+    try:
+        from tts import load_live_engine
+        engine = load_live_engine()
+    except Exception as exc:
+        print(f"[prewarm] TTS engine failed to load: {exc}")
+        engine = None
+    proc.userdata["tts"] = engine
     proc.userdata["dependencies"] = LazyDependencies()
     proc.userdata["artifact_index"] = ArtifactIndex(LECTURES_DIR)
     proc.userdata["startup_count"] = 0
