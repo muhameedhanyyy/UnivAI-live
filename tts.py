@@ -18,14 +18,15 @@ rather than letting a demo fail quietly.
 from __future__ import annotations
 
 import os
-import sys
 import time
 from pathlib import Path
 
 import numpy as np
 from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))  # campus plumbing
+from campus_imports import configure_campus_imports
+
+configure_campus_imports()
 from common.device import device, describe  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]

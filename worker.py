@@ -28,12 +28,12 @@ import asyncio
 import json
 import os
 import re
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from runtime import RuntimeMode, runtime_mode
+from campus_imports import configure_campus_imports
 
 if runtime_mode() is RuntimeMode.STANDALONE:
     raise RuntimeError(
@@ -41,9 +41,8 @@ if runtime_mode() is RuntimeMode.STANDALONE:
         "Use 'python simulate.py run' for standalone mode."
     )
 
-# This cave (UnivAI-live) is checked out inside the UnivAI campus repo; the
-# shared plumbing (clock, db, LLM, RAG client) lives there in services/.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
+# Shared modules use both common.* and services.* package names internally.
+configure_campus_imports()
 
 import numpy as np
 from dotenv import load_dotenv

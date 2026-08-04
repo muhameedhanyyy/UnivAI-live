@@ -20,12 +20,13 @@ from pathlib import Path
 
 import numpy as np
 
+from campus_imports import configure_campus_imports
+
 # Lecture titles land in log prints; a redirected Windows stdout is cp1252.
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))  # campus plumbing
-sys.path.insert(0, str(Path(__file__).resolve().parent))                   # tts.py, same cave
+configure_campus_imports()
 
 from common.sentences import split_sentences  # noqa: E402
 
