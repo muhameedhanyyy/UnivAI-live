@@ -10,11 +10,11 @@ model that actually served it.
 from __future__ import annotations
 
 import asyncio
-import sys
 import time
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))  # campus plumbing
+from campus_imports import configure_campus_imports
+
+configure_campus_imports()
 
 from common.clock import now  # noqa: E402
 from common.db import execute  # noqa: E402
