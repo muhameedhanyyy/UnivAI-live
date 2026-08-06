@@ -7,6 +7,7 @@ dependencies = []
 [project.optional-dependencies]
 integrated = [
   "faster-whisper>=1.1",
+  "kokoro-onnx>=0.4",
   "livekit-agents>=0.12",
   "livekit-plugins-silero>=0.7",
   "numpy>=1.26",
