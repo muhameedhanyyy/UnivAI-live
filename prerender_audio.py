@@ -22,31 +22,37 @@ def prerender_all(
     book_id: int | None = None,
     log=print,
 ) -> dict:
+    # Every filter is optional, so each placeholder needs its type spelled out:
+    # a bare NULL leaves Postgres unable to infer one and the whole query fails
+    # with IndeterminateDatatype before a single sentence is rendered.
     rows = fetch_all(
         """SELECT artifact_id::text AS artifact_id, student_id, week,
                   script_payload
              FROM lecture_artifacts
-            WHERE (%s IS NULL OR student_id = %s)
-              AND (%s IS NULL OR week = %s)
-              AND (%s IS NULL OR book_id = %s)
+            WHERE (%s::text IS NULL OR student_id = %s::text)
+              AND (%s::int IS NULL OR week = %s::int)
+              AND (%s::int IS NULL OR book_id = %s::int)
             ORDER BY student_id, week""",
         (sid, sid, week, week, book_id, book_id),
     )
-    engine = load_live_engine()
     cache = AudioCache()
     rendered = reused = 0
+    # Loading the TTS model costs seconds and a lot of memory. A course adopted
+    # from another learner is already entirely cached, so the engine is loaded
+    # on the first genuine miss and never at all for a pure warm-up.
+    engine = None
     for row in rows:
         script = row["script_payload"]
         digest = script_digest(script)
-        artifact_id = str(row["artifact_id"])
         for segment_index, segment in enumerate(script["segments"]):
             for sentence_index, sentence in enumerate(split_sentences(segment["text"])):
-                if cache.load(artifact_id, digest, segment_index, sentence_index) is not None:
+                if cache.load(digest, segment_index, sentence_index) is not None:
                     reused += 1
                     continue
+                if engine is None:
+                    engine = load_live_engine()
                 audio = engine.render(sentence)
                 cache.store(
-                    artifact_id,
                     digest,
                     segment_index,
                     sentence_index,
@@ -60,7 +66,7 @@ def prerender_all(
         "lectures": len(rows),
         "rendered": rendered,
         "reused": reused,
-        "sample_rate": engine.sample_rate,
+        "sample_rate": engine.sample_rate if engine is not None else None,
     }
     log(json.dumps(result, sort_keys=True))
     return result

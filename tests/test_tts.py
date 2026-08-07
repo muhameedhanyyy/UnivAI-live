@@ -1,4 +1,14 @@
-import tts
+import pytest
+
+# tts.py reads .env through python-dotenv and imports common.device from the
+# campus checkout (UnivAI/services). CI checks Live out on its own, with
+# neither available, so the module cannot be imported there at all — and an
+# uncaught ImportError in a test module fails collection for the whole suite,
+# not just this file. Skipping keeps these cases running wherever the campus is
+# present, which is where the engine choice they cover actually matters.
+tts = pytest.importorskip(
+    "tts", reason="tts needs python-dotenv and the campus services checkout"
+)
 
 
 def test_piper_defaults_to_cpu_without_probing_cuda(monkeypatch):
