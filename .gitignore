@@ -9,3 +9,5 @@ __pycache__/
 *.log
 output.wav
 .standalone/
+# rendered narration; disposable, and rebuilt on demand from the database
+.audio-cache/

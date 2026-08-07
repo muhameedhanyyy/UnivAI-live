@@ -232,7 +232,6 @@ class LectureSession:
         """Use the shared render cache, synthesizing and populating it on miss."""
         if self.audio_cache is not None:
             cached = self.audio_cache.load(
-                self.lecture.artifact_id,
                 self.lecture.script_digest,
                 segment,
                 sentence,
@@ -244,7 +243,6 @@ class LectureSession:
         if self.audio_cache is not None and len(audio):
             await asyncio.to_thread(
                 self.audio_cache.store,
-                self.lecture.artifact_id,
                 self.lecture.script_digest,
                 segment,
                 sentence,
