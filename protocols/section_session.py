@@ -8,6 +8,7 @@ from typing import Any
 
 SECTION_META_SCHEMA = "univai.section-session-meta"
 SECTION_META_VERSION = "1.0.0"
+SECTION_REFERENCE_VERSION = "2.0.0"
 SECTION_PACK_SCHEMA = "univai.section.pack"
 SECTION_PACK_VERSION = "1.0.0"
 
@@ -16,6 +17,34 @@ class SectionContractError(ValueError):
     def __init__(self, message: str, *, field: str = "") -> None:
         super().__init__(message)
         self.field = field
+
+
+@dataclass(frozen=True)
+class SectionSessionReferenceV2:
+    learner_id: str
+    section_pack_id: str
+    nonce: str
+
+    @classmethod
+    def from_room_metadata(
+        cls, raw: str, *, authenticated_learner_id: str
+    ) -> "SectionSessionReferenceV2":
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise SectionContractError("section room metadata must be valid JSON", field="roomMetadata") from exc
+        if not isinstance(data, dict):
+            raise SectionContractError("section room metadata must be an object", field="roomMetadata")
+        if data.get("schema_name") != SECTION_META_SCHEMA or data.get("schema_version") != SECTION_REFERENCE_VERSION:
+            raise SectionContractError("unsupported section reference schema", field="schema_version")
+        learner_id = _text(data, "learner_id")
+        if learner_id != authenticated_learner_id:
+            raise SectionContractError("authenticated learner does not own this section", field="learner_id")
+        return cls(
+            learner_id=learner_id,
+            section_pack_id=_text(data, "section_pack_id"),
+            nonce=_text(data, "nonce"),
+        )
 
 
 @dataclass(frozen=True)
@@ -31,6 +60,38 @@ class SectionSessionMetaV1:
     pack: dict[str, Any]
     schema_name: str = SECTION_META_SCHEMA
     schema_version: str = SECTION_META_VERSION
+
+    @classmethod
+    def from_storage(
+        cls,
+        reference: SectionSessionReferenceV2,
+        *,
+        programme_id: str,
+        programme_title: str,
+        course_id: str,
+        week: int,
+        lecture_id: str,
+        plan_version: int,
+        lecture_completed: bool,
+        pack: object,
+    ) -> "SectionSessionMetaV1":
+        payload = {
+            "schema_name": SECTION_META_SCHEMA,
+            "schema_version": SECTION_META_VERSION,
+            "learner_id": reference.learner_id,
+            "programme_id": programme_id,
+            "programme_title": programme_title,
+            "course_id": course_id,
+            "week": week,
+            "lecture_id": lecture_id,
+            "plan_version": plan_version,
+            "lecture_completed": lecture_completed,
+            "pack": pack,
+        }
+        return cls.from_room_metadata(
+            json.dumps(payload),
+            authenticated_learner_id=reference.learner_id,
+        )
 
     @classmethod
     def from_room_metadata(cls, raw: str, *, authenticated_learner_id: str) -> "SectionSessionMetaV1":

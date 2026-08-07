@@ -20,8 +20,9 @@ class DependencyHealth:
 def dependency_health() -> list[DependencyHealth]:
     return [
         _endpoint("livekit", os.getenv("LIVEKIT_URL")),
+        _endpoint("database", os.getenv("DATABASE_URL")),
         _model("stt", os.getenv("STT_MODEL_PATH"), allow_named=os.getenv("STT_MODEL_SIZE")),
-        _model("tts", os.getenv("KOKORO_MODEL") or os.getenv("PIPER_MODEL")),
+        _model("tts", _tts_model_path()),
         _endpoint("agent", os.getenv("RAG_MCP_URL") or os.getenv("RAG_URL") or os.getenv("AGENT_URL")),
     ]
 
@@ -41,15 +42,30 @@ def _endpoint(name: str, value: str | None) -> DependencyHealth:
     parsed = urlparse(value if "://" in value else f"tcp://{value}")
     if not parsed.hostname:
         return DependencyHealth(name, False, "invalid_endpoint")
-    return DependencyHealth(name, True, "configured")
+    port = parsed.port or (443 if parsed.scheme in {"https", "wss"} else 80)
+    try:
+        with socket.create_connection((parsed.hostname, port), timeout=1.5):
+            return DependencyHealth(name, True, "reachable")
+    except OSError as exc:
+        return DependencyHealth(name, False, f"unreachable:{type(exc).__name__}")
 
 
 def _model(name: str, path: str | None, *, allow_named: str | None = None) -> DependencyHealth:
     if path:
         return DependencyHealth(name, Path(path).expanduser().is_file(), "available" if Path(path).expanduser().is_file() else "model_missing")
     if allow_named:
-        return DependencyHealth(name, True, "named_model_configured")
+        # Faster Whisper is deliberately lazy because it is not on the
+        # lecture's first-audio path. A configured model name is ready for that
+        # design; loading it during container health probes would defeat it.
+        return DependencyHealth(name, True, "configured_lazy_model")
     return DependencyHealth(name, False, "not_configured")
+
+
+def _tts_model_path() -> str | None:
+    engine = os.getenv("TTS_LIVE_ENGINE") or os.getenv("TTS_ENGINE", "kokoro")
+    if engine.lower() == "piper":
+        return os.getenv("PIPER_MODEL", "models/piper/en_US-lessac-medium.onnx")
+    return os.getenv("KOKORO_MODEL", "models/kokoro/kokoro-v1.0.onnx")
 
 
 if __name__ == "__main__":

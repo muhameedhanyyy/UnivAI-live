@@ -5,7 +5,7 @@
 
 State machine (exactly as specified):
 
-    LECTURING    stream script.json through TTS, sentence by sentence.
+    LECTURING    stream the database script through TTS, sentence by sentence.
                  Each segment sends {type:"slide", n} so the Slidev iframe flips.
                  Student speaks (VAD >= 300 ms) -> INTERRUPTED
 
@@ -54,11 +54,12 @@ from protocols.lecture_session import LectureSessionMeta, SessionMetadataError  
 from qa import TROUBLE, answer_question  # noqa: E402
 from tts import load_live_engine  # noqa: E402
 from prompt_cache import PromptCache  # noqa: E402
-from startup import ArtifactIndex, LazyDependencies, StartupStage, StartupTrace  # noqa: E402
+from startup import LazyDependencies, StartupStage, StartupTrace  # noqa: E402
 from telemetry.startup_metrics import append_trace  # noqa: E402
 from question_turn import QuestionTurnController, TurnState  # noqa: E402
 from resilience.fallbacks import choose_fallback  # noqa: E402
 from resilience.timeouts import Stage, StageTimeout, within_budget  # noqa: E402
+from audio_cache import AudioCache, script_digest  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
@@ -69,12 +70,16 @@ _url = os.getenv("LIVEKIT_URL", "")
 if "://localhost" in _url:
     os.environ["LIVEKIT_URL"] = _url.replace("://localhost", "://127.0.0.1")
 
-LECTURES_DIR = ROOT / "lectures"
 STT_MODEL_SIZE = os.getenv("STT_MODEL_SIZE", "base")
 
 SPEECH_TRIGGER_MS = 300     # this much speech from the student = a barge-in
 SILENCE_END_MS = 800        # this much silence = they have finished asking
 REVIEW_TIMEOUT_S = 120      # how long we hold the lecture while they edit the transcript
+PROMPT_TEXTS = {
+    "ask": "Yes? Do you have a question? Unmute your microphone and go ahead.",
+    "remind": "Your hand is still raised. Unmute whenever you are ready; I am listening.",
+    "resume": "No question? No problem. Alright everyone, eyes back on the slides, and let us continue!",
+}
 
 
 def log(message: str) -> None:
@@ -102,62 +107,61 @@ class Lecture:
     segments: list[dict]
     # The owner (studentId). Scopes RAG retrieval for live Q&A and the qa_log.
     sid: str = ""
+    artifact_id: str = ""
+    script_digest: str = ""
     position: Position = field(default_factory=Position)
-    # Pre-rendered voice (prerender_audio.py, this cave). When present, the
-    # lecture NEVER touches a TTS model — it plays from disk.
-    audio_dir: Path | None = None
-    audio_rate: int | None = None
 
     @staticmethod
     def load(
         sid: str,
         week: int,
-        ordered_segments: tuple[dict[str, int | str], ...] | None = None,
+        artifact_id: str,
     ) -> "Lecture":
-        # Per-student course on disk: lectures/<studentId>/week-N/.
-        folder = LECTURES_DIR / sid / f"week-{week}"
-        script = json.loads((folder / "script.json").read_text("utf-8"))
-        segments = (
-            [dict(segment) for segment in ordered_segments]
-            if ordered_segments
-            else script["segments"]
+        from common.db import fetch_one
+        row = fetch_one(
+            """SELECT la.script_payload FROM lectures l
+                 JOIN lecture_artifacts la ON la.artifact_id = l.lecture_artifact_id
+                WHERE l.student_id = %s AND l.week = %s
+                  AND la.artifact_id = %s::uuid""",
+            (sid, week, artifact_id),
         )
-        lecture = Lecture(week=week, title=script["title"], segments=segments, sid=sid)
-        meta = folder / "audio" / "meta.json"
-        if meta.exists():
-            lecture.audio_dir = folder / "audio"
-            lecture.audio_rate = int(json.loads(meta.read_text("utf-8"))["sample_rate"])
-        return lecture
-
-    def clip(self, segment: int, sentence: int) -> np.ndarray | None:
-        if not self.audio_dir:
-            return None
-        path = self.audio_dir / f"s{segment}-t{sentence}.npy"
-        return np.load(path) if path.exists() else None
-
+        if not row or not isinstance(row.get("script_payload"), dict):
+            raise FileNotFoundError("database lecture artifact is missing")
+        script = row["script_payload"]
+        segments = script.get("segments")
+        if not isinstance(segments, list) or not segments:
+            raise ValueError("database lecture has no narration segments")
+        digest = script_digest(script)
+        return Lecture(
+            week=week,
+            title=script["title"],
+            segments=segments,
+            sid=sid,
+            artifact_id=artifact_id,
+            script_digest=digest,
+        )
 
 # ---------------------------------------------------------------- the worker
 
 
 class LectureSession:
-    def __init__(self, room: rtc.Room, lecture: Lecture, tts, session_meta: LectureSessionMeta | None = None, *, startup_trace: StartupTrace | None = None, startup_mode: str = "warm", dependencies: LazyDependencies | None = None) -> None:
+    def __init__(self, room: rtc.Room, lecture: Lecture, tts, session_meta: LectureSessionMeta | None = None, *, startup_trace: StartupTrace | None = None, startup_mode: str = "warm", dependencies: LazyDependencies | None = None, audio_cache: AudioCache | None = None) -> None:
         self.room = room
         self.lecture = lecture
         self.session_meta = session_meta
-        # Loaded in prewarm(). May be None on a RAM-starved machine — the
-        # lecture still plays (pre-rendered on disk); only live answers then
-        # need the on-demand Piper fallback in _engine().
+        # Loaded in prewarm(). A missing engine leaves the data-channel text
+        # usable, but cannot publish voice until the retry succeeds.
         self.tts = tts
         self._engine_retry = False
         self.startup_trace = startup_trace
         self.startup_mode = startup_mode
         self.dependencies = dependencies
+        self.audio_cache = audio_cache
         self._first_frame_recorded = False
 
         # Engines differ: Piper is 22.05 kHz, XTTS is 24 kHz. Publishing at the
         # wrong rate does not fail — it just makes the lecturer sound wrong.
-        # The pre-rendered bank's rate wins: that is most of what gets played.
-        self.sample_rate = lecture.audio_rate or (tts.sample_rate if tts else 24000)
+        self.sample_rate = tts.sample_rate if tts else 24000
         self.source = rtc.AudioSource(self.sample_rate, 1)
         self.track = rtc.LocalAudioTrack.create_audio_track("lecturer", self.source)
 
@@ -225,11 +229,29 @@ class LectureSession:
         return self._fit(audio, engine.sample_rate)
 
     async def sentence_audio(self, segment: int, sentence: int, text: str) -> np.ndarray:
-        """Disk first: a pre-rendered sentence costs a read, not a model."""
-        clip = self.lecture.clip(segment, sentence)
-        if clip is not None:
-            return self._fit(clip, self.lecture.audio_rate)
-        return await self.render(text)
+        """Use the shared render cache, synthesizing and populating it on miss."""
+        if self.audio_cache is not None:
+            cached = self.audio_cache.load(
+                self.lecture.artifact_id,
+                self.lecture.script_digest,
+                segment,
+                sentence,
+            )
+            if cached is not None:
+                audio, rate = cached
+                return self._fit(audio, rate)
+        audio = await self.render(text)
+        if self.audio_cache is not None and len(audio):
+            await asyncio.to_thread(
+                self.audio_cache.store,
+                self.lecture.artifact_id,
+                self.lecture.script_digest,
+                segment,
+                sentence,
+                audio,
+                self.sample_rate,
+            )
+        return audio
 
     async def play(self, audio: np.ndarray, interruptible: bool = True) -> bool:
         """Stream one rendered sentence. False = the student cut in, or the room died."""
@@ -262,7 +284,7 @@ class LectureSession:
                         if trace_path:
                             append_trace(Path(trace_path), payload)
                         if self.dependencies:
-                            asyncio.create_task(self.dependencies.warm())
+                            asyncio.create_task(self._warm_after_first_frame())
                 except Exception as exc:
                     # The student closed the tab mid-sentence. Stop talking to an
                     # empty room rather than crashing the worker.
@@ -275,6 +297,31 @@ class LectureSession:
 
     async def speak(self, text: str, interruptible: bool = True) -> bool:
         return await self.play(await self.render(text), interruptible=interruptible)
+
+    async def _warm_after_first_frame(self) -> None:
+        """Prepare interaction models and prompts after narration is audible."""
+        results = await self.dependencies.warm()
+        engine = results[0]
+        if isinstance(engine, BaseException):
+            print(f"[tts] deferred engine warmup failed: {engine}")
+            return
+        self.tts = engine
+        rendered = await asyncio.gather(
+            *(self.render(text) for text in PROMPT_TEXTS.values()),
+            return_exceptions=True,
+        )
+        for key, audio in zip(PROMPT_TEXTS, rendered):
+            if isinstance(audio, np.ndarray) and len(audio):
+                self.prompts[key] = audio
+
+    async def _play_prompt(self, key: str) -> None:
+        audio = self.prompts.get(key)
+        if audio is None:
+            audio = await self.render(PROMPT_TEXTS[key])
+            if len(audio):
+                self.prompts[key] = audio
+        if len(audio):
+            await self.play(audio, interruptible=False)
 
     # -- the state machine ------------------------------------------------------
 
@@ -313,14 +360,25 @@ class LectureSession:
                 await self.send({"type": "slide", "n": slide})
                 current_slide = slide
 
-            audio = (
-                await upcoming
-                if upcoming
-                else await self.sentence_audio(s_index, t_index, sentence)
-            )
+            try:
+                if upcoming:
+                    audio = await upcoming
+                elif index == 0 and self.startup_trace:
+                    audio = await asyncio.wait_for(
+                        self.sentence_audio(s_index, t_index, sentence),
+                        timeout=self.startup_trace.remaining(),
+                    )
+                else:
+                    audio = await self.sentence_audio(s_index, t_index, sentence)
+            except (asyncio.TimeoutError, TimeoutError):
+                await self._startup_failed("first_audio_timeout", "The lecturer could not start audio in time. Please retry.")
+                return
             upcoming = None
 
             if index == 0:
+                if not len(audio):
+                    await self._startup_failed("first_audio_unavailable", "The lecturer's voice is unavailable. Please retry.")
+                    return
                 # The first audio exists - NOW "speaking" is true.
                 await self.send({"type": "state", "state": "lecturing"})
 
@@ -330,6 +388,9 @@ class LectureSession:
                 upcoming = asyncio.create_task(self.sentence_audio(next_s, next_t, next_text))
 
             finished = await self.play(audio)
+            if index == 0 and not self._first_frame_recorded:
+                await self._startup_failed("first_frame_unavailable", "The lecture audio stream did not start. Please retry.")
+                return
             if self.closed:
                 break
             if finished:
@@ -347,6 +408,20 @@ class LectureSession:
 
         position.segment = len(segments)
         await self.send({"type": "state", "state": "ended"})
+
+    async def _startup_failed(self, reason: str, detail: str) -> None:
+        await self.send({"type": "progress", "stage": "problem", "detail": detail})
+        await self.send({"type": "state", "state": "ended"})
+        if self.startup_trace:
+            payload = self.startup_trace.payload(
+                mode=self.startup_mode,
+                outcome="failed",
+                reason_code=reason,
+            )
+            print(json.dumps(payload, sort_keys=True), flush=True)
+            trace_path = os.getenv("STARTUP_TRACE_PATH")
+            if trace_path:
+                append_trace(Path(trace_path), payload)
 
     async def _wait_for_unmute(self, seconds: float) -> bool:
         try:
@@ -367,14 +442,12 @@ class LectureSession:
             return
 
         await self.send({"type": "state", "state": "asking"})
-        if "ask" in self.prompts:
-            await self.play(self.prompts["ask"], interruptible=False)
+        await self._play_prompt("ask")
         await self.send({"type": "hand", "state": "acked"})
 
         unmuted = await self._wait_for_unmute(4.0)
         if not unmuted:
-            if "remind" in self.prompts:
-                await self.play(self.prompts["remind"], interruptible=False)
+            await self._play_prompt("remind")
             unmuted = await self._wait_for_unmute(8.0)
 
         answered = False
@@ -390,9 +463,9 @@ class LectureSession:
             await self.question_turn.close("no_speech" if unmuted else "unmute_timeout")
 
         await self.send({"type": "hand", "state": "lowered"})
-        if not answered and "resume" in self.prompts:
+        if not answered:
             # No question came. Lower the hand and catch the room's attention.
-            await self.play(self.prompts["resume"], interruptible=False)
+            await self._play_prompt("resume")
 
     async def collect_and_answer(self) -> bool:
         """Capture the question, let the student edit the transcript, answer it.
@@ -611,42 +684,57 @@ async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model) ->
 
 
 def prewarm(proc: agents.JobProcess) -> None:
-    """Load the models once, when the worker starts — not when a student joins.
-
-    Every piece here is allowed to fail: lectures play from disk, prompts come
-    pre-rendered from disk, and a missing engine only degrades live answers."""
-    try:
-        from tts import load_live_engine
-        engine = load_live_engine()
-    except Exception as exc:
-        print(f"[prewarm] TTS engine failed to load: {exc}")
-        engine = None
-    proc.userdata["tts"] = engine
+    """Initialize only cheap state required to accept a LiveKit job."""
+    proc.userdata["tts"] = None
     proc.userdata["dependencies"] = LazyDependencies()
-    proc.userdata["artifact_index"] = ArtifactIndex(LECTURES_DIR)
-    proc.userdata["startup_count"] = 0
+    proc.userdata["audio_cache"] = AudioCache()
 
     # Generic prompts contain no learner data. Personalized clips are loaded
     # per authenticated session from PromptCache below.
-    prompts: dict[str, np.ndarray] = {}
-    rate = engine.sample_rate if engine else 24000
-    if engine is not None:
-        prompt_texts = {
-            "ask": "Yes? Do you have a question? Unmute your microphone and go ahead.",
-            "remind": "Your hand is still raised. Unmute whenever you are ready; I am listening.",
-            "resume": "No question? No problem. Alright everyone, eyes back on the slides, and let us continue!",
-        }
-        prompts = {key: engine.render(text) for key, text in prompt_texts.items()}
-    proc.userdata["prompts"] = prompts
-    proc.userdata["prompts_rate"] = rate
+    proc.userdata["prompts"] = {}
+    proc.userdata["prompts_rate"] = 24000
     proc.userdata["prompt_cache"] = PromptCache(Path(os.getenv("PROMPT_CACHE_DIR", str(Path(__file__).parent / ".prompt-cache"))))
 
     proc.userdata["stt"] = None
 
 
+def _startup_mode() -> str:
+    value = os.getenv("STARTUP_MODE", "warm").strip().lower()
+    return value if value in {"cold", "warm"} else "warm"
+
+
+def _write_startup_trace(trace: StartupTrace, *, outcome: str, reason: str | None = None) -> None:
+    payload = trace.payload(mode=_startup_mode(), outcome=outcome, reason_code=reason)
+    print(json.dumps(payload, sort_keys=True), flush=True)
+    trace_path = os.getenv("STARTUP_TRACE_PATH")
+    if trace_path:
+        append_trace(Path(trace_path), payload)
+
+
+async def _fail_job_startup(
+    ctx: agents.JobContext,
+    trace: StartupTrace,
+    *,
+    reason: str,
+    detail: str,
+) -> None:
+    try:
+        await ctx.room.local_participant.publish_data(
+            json.dumps({"type": "progress", "stage": "problem", "detail": detail}).encode("utf-8"),
+            reliable=True,
+        )
+    except Exception:
+        pass
+    _write_startup_trace(trace, outcome="failed", reason=reason)
+
+
 async def entrypoint(ctx: agents.JobContext) -> None:
     trace = StartupTrace()
-    await asyncio.wait_for(ctx.connect(), timeout=trace.remaining())
+    try:
+        await asyncio.wait_for(ctx.connect(), timeout=trace.remaining())
+    except (asyncio.TimeoutError, TimeoutError, ConnectionError):
+        _write_startup_trace(trace, outcome="failed", reason="room_connect_failed")
+        return
     trace.mark(StartupStage.ROOM_CONNECTED)
 
     raw_meta = getattr(ctx.room, "metadata", None) or ""
@@ -682,39 +770,41 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         )
     except SessionMetadataError as exc:
         print(f"[lecture] ERROR: {exc} (field={exc.field!r})")
-        await ctx.room.local_participant.publish_data(
-            json.dumps({
-                "type": "progress",
-                "stage": "problem",
-                "detail": f"Invalid lecture session metadata ({exc.field}): {exc}",
-            }).encode("utf-8"),
-            reliable=True,
+        await _fail_job_startup(
+            ctx,
+            trace,
+            reason="metadata_invalid",
+            detail=f"Invalid lecture session metadata ({exc.field}): {exc}",
         )
         return
 
     try:
-        ctx.proc.userdata["artifact_index"].require(sid, week)
-        lecture = Lecture.load(sid, week, session_meta.segments)
+        lecture = await asyncio.wait_for(
+            asyncio.to_thread(Lecture.load, sid, week, session_meta.artifact_id),
+            timeout=trace.remaining(),
+        )
         trace.mark(StartupStage.ARTIFACT_LOADED)
-    except (OSError, ValueError) as exc:
-        await ctx.room.local_participant.publish_data(json.dumps({
-            "type": "progress", "stage": "problem", "detail": str(exc),
-        }).encode(), reliable=True)
+    except (OSError, ValueError, asyncio.TimeoutError, TimeoutError) as exc:
+        await _fail_job_startup(
+            ctx,
+            trace,
+            reason="artifact_unavailable",
+            detail=f"The lecture artifact is unavailable: {exc}",
+        )
         return
     print(f"[lecture] {sid} week {week}: {lecture.title} ({len(lecture.segments)} segments)")
 
-    count = ctx.proc.userdata["startup_count"]
-    ctx.proc.userdata["startup_count"] = count + 1
+    startup_mode = _startup_mode()
     session = LectureSession(
         ctx.room, lecture, ctx.proc.userdata["tts"], session_meta,
-        startup_trace=trace, startup_mode="cold" if count == 0 else "warm",
+        startup_trace=trace, startup_mode=startup_mode,
         dependencies=ctx.proc.userdata["dependencies"],
+        audio_cache=ctx.proc.userdata["audio_cache"],
     )
     prompts_rate = ctx.proc.userdata.get("prompts_rate")
     prompt_bank = ctx.proc.userdata["prompts"]
     try:
-        signed = json.loads(raw_meta)
-        display_name = signed.get("display_name")
+        display_name = session_meta.display_name
         engine = ctx.proc.userdata.get("tts")
         if isinstance(display_name, str):
             prompt_bank, cached_rate = ctx.proc.userdata["prompt_cache"].load(
@@ -780,6 +870,19 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 asyncio.create_task(finalize_after_drain())
             else:
                 session.mic_unmuted.set()
+        elif message.get("type") == "startup_audio_playing":
+            elapsed = message.get("client_elapsed_ms")
+            if isinstance(elapsed, (int, float)) and 0 <= elapsed <= 60_000:
+                client_event = {
+                    "schema": "univai.live.client-first-audio",
+                    "trace_id": trace.trace_id,
+                    "mode": session.startup_mode,
+                    "client_elapsed_ms": round(elapsed),
+                }
+                print(json.dumps(client_event, sort_keys=True), flush=True)
+                trace_path = os.getenv("STARTUP_TRACE_PATH")
+                if trace_path:
+                    append_trace(Path(trace_path), client_event)
 
     @ctx.room.on("disconnected")
     def on_disconnected(*_: object) -> None:
@@ -790,20 +893,75 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
 async def _run_section(ctx: agents.JobContext, raw_meta: str, trace: StartupTrace) -> None:
     """Minimal LiveKit adapter around the repository-local section controller."""
-    from protocols.section_session import SectionContractError, SectionSessionMetaV1
+    from protocols.section_session import (
+        SECTION_REFERENCE_VERSION,
+        SectionContractError,
+        SectionSessionMetaV1,
+        SectionSessionReferenceV2,
+    )
     from section_controller import SectionController
 
     prefix, separator, _week = ctx.room.name.rpartition("-week-")
     learner_id = prefix[len("section-") :] if separator and prefix.startswith("section-") else ""
     try:
-        meta = SectionSessionMetaV1.from_room_metadata(raw_meta, authenticated_learner_id=learner_id)
+        decoded = json.loads(raw_meta)
+        if isinstance(decoded, dict) and decoded.get("schema_version") == SECTION_REFERENCE_VERSION:
+            reference = SectionSessionReferenceV2.from_room_metadata(
+                raw_meta,
+                authenticated_learner_id=learner_id,
+            )
+            from common.db import fetch_one
+
+            row = await asyncio.wait_for(
+                asyncio.to_thread(
+                    fetch_one,
+                    """SELECT sp.programme_id, p.name AS programme_title,
+                              sp.course_id, sp.week, sp.lecture_id,
+                              sp.approved_plan_version, sp.pack_payload,
+                              (a.completed_at IS NOT NULL) AS lecture_completed
+                         FROM section_packs sp
+                         JOIN programmes p ON p.id::text = sp.programme_id
+                          AND p.student_id = sp.tenant_id
+                          AND p.status = 'approved'
+                          AND p.plan_version = sp.approved_plan_version
+                         JOIN lectures l ON l.student_id = sp.tenant_id
+                          AND l.week = sp.week
+                         LEFT JOIN attendance a ON a.lecture_id = l.id
+                          AND a.student_id = sp.tenant_id
+                        WHERE sp.tenant_id = %s AND sp.section_pack_id = %s
+                        LIMIT 1""",
+                    (learner_id, reference.section_pack_id),
+                ),
+                timeout=trace.remaining(),
+            )
+            if not row:
+                raise SectionContractError("section pack was not found", field="section_pack_id")
+            meta = SectionSessionMetaV1.from_storage(
+                reference,
+                programme_id=str(row["programme_id"]),
+                programme_title=str(row["programme_title"]),
+                course_id=str(row["course_id"]),
+                week=int(row["week"]),
+                lecture_id=str(row["lecture_id"]),
+                plan_version=int(row["approved_plan_version"]),
+                lecture_completed=bool(row["lecture_completed"]),
+                pack=row["pack_payload"],
+            )
+        else:
+            # One-version rolling-deploy compatibility. New App releases send
+            # only the v2 reference; legacy metadata remains accepted briefly.
+            meta = SectionSessionMetaV1.from_room_metadata(
+                raw_meta,
+                authenticated_learner_id=learner_id,
+            )
         trace.mark(StartupStage.METADATA_VALID)
         trace.mark(StartupStage.ARTIFACT_LOADED)
-    except SectionContractError as exc:
+    except (SectionContractError, asyncio.TimeoutError, TimeoutError, ValueError) as exc:
         await ctx.room.local_participant.publish_data(json.dumps({
             "type": "section_error", "schema_version": "1.0.0",
-            "payload": {"field": exc.field, "message": str(exc)},
+            "payload": {"field": getattr(exc, "field", "section_pack_id"), "message": str(exc)},
         }).encode(), reliable=True)
+        _write_startup_trace(trace, outcome="failed", reason="section_artifact_unavailable")
         return
 
     engine = ctx.proc.userdata.get("tts")
@@ -822,9 +980,7 @@ async def _run_section(ctx: agents.JobContext, raw_meta: str, trace: StartupTrac
         if not first_content:
             first_content = True
             trace.mark(StartupStage.FIRST_FRAME)
-            count = ctx.proc.userdata["startup_count"]
-            ctx.proc.userdata["startup_count"] = count + 1
-            payload = trace.payload(mode="cold" if count == 0 else "warm")
+            payload = trace.payload(mode=_startup_mode())
             print(json.dumps(payload, sort_keys=True), flush=True)
             trace_path = os.getenv("STARTUP_TRACE_PATH")
             if trace_path:
@@ -844,6 +1000,14 @@ async def _run_section(ctx: agents.JobContext, raw_meta: str, trace: StartupTrac
         except StageTimeout:
             await emit(choose_fallback("tts", "tts_timeout").event())
             return
+        engine_rate = getattr(engine, "sample_rate", sample_rate)
+        if engine_rate != sample_rate and len(audio):
+            output_length = int(len(audio) * sample_rate / engine_rate)
+            audio = np.interp(
+                np.linspace(0, len(audio) - 1, output_length),
+                np.arange(len(audio)),
+                audio,
+            ).astype(np.float32)
         for start in range(0, len(audio), sample_rate // 10):
             pcm = (np.clip(audio[start : start + sample_rate // 10], -1, 1) * 32767).astype(np.int16)
             await source.capture_frame(rtc.AudioFrame(data=pcm.tobytes(), sample_rate=sample_rate, num_channels=1, samples_per_channel=len(pcm)))
@@ -877,13 +1041,12 @@ async def _run_section(ctx: agents.JobContext, raw_meta: str, trace: StartupTrac
             await controller.complete()
 
 
+server = agents.AgentServer(initialize_process_timeout=10.0)
+server.setup_fnc = prewarm
+# Keep this worker unnamed so rooms receive automatic dispatch. Naming an agent
+# opts into explicit dispatch, which the UnivAI token routes do not request.
+server.rtc_session(entrypoint)
+
+
 if __name__ == "__main__":
-    agents.cli.run_app(
-        agents.WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            prewarm_fnc=prewarm,
-            # Lightweight indexing is bounded; models are deferred until after
-            # the first content frame has made the room visibly ready.
-            initialize_process_timeout=8.0,
-        )
-    )
+    agents.cli.run_app(server)

@@ -15,8 +15,16 @@ from simulate import fixture_answer, run_simulation
 class LiveSimulatorTests(unittest.TestCase):
     def test_room_name(self) -> None:
         self.assertEqual(("S-2026-000042", 3), parse_room_name("lecture-S-2026-000042-week-3"))
+        self.assertEqual(("S-2026-000013", 5), parse_room_name("lecture-S-2026-000013-week-5"))
+        self.assertEqual(("S-2026-000013", 52), parse_room_name("lecture-S-2026-000013-week-52"))
         with self.assertRaises(ValueError):
             parse_room_name("wrong-room")
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            parse_room_name("lecture-S-2026-000013-week-0")
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            parse_room_name("lecture-S-2026-000013-week-five")
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            parse_room_name("lecture-S-2026-000013-week-+5")
 
     def test_fixture_and_protocol(self) -> None:
         script = json.loads(

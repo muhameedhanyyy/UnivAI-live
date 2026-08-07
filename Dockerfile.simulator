@@ -1,0 +1,5 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY . .
+ENV PYTHONUNBUFFERED=1 UNIVAI_MODE=standalone UNIVAI_ENV=development
+CMD ["python", "simulate.py", "run"]

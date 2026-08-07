@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from pathlib import Path
 CAMPUS_ROOT = Path(__file__).resolve().parent.parent
 
 
-def configure_campus_imports(campus_root: Path = CAMPUS_ROOT) -> tuple[Path, Path]:
+def configure_campus_imports(campus_root: Path | None = None) -> tuple[Path, Path]:
     """Expose both supported shared-service package names.
 
     Live historically imports ``common.*`` from ``UnivAI/services`` while the
@@ -17,7 +18,11 @@ def configure_campus_imports(campus_root: Path = CAMPUS_ROOT) -> tuple[Path, Pat
     roots are therefore required when a Live script is launched directly.
     """
 
-    campus_root = campus_root.resolve()
+    configured = os.getenv("UNIVAI_INTEGRATION_ROOT")
+    campus_root = (
+        campus_root
+        or (Path(configured).expanduser() if configured else CAMPUS_ROOT)
+    ).resolve()
     services_root = campus_root / "services"
     for root in (campus_root, services_root):
         value = str(root)

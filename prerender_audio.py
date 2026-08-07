@@ -1,192 +1,80 @@
-"""Pre-render the lecturer's voice to disk, so lectures never wait on TTS.
-
-    python UnivAI-live/prerender_audio.py   (from the UnivAI campus root)
-
-For every week this renders each sentence of script.json to
-lectures/week-N/audio/s{segment}-t{sentence}.npy (float32 PCM) plus a
-meta.json with the sample rate. Personalized raise-hand prompts are produced
-through the authenticated prompt-cache prewarm flow. Joining a lecture
-costs a disk read, not a model load — and a machine too starved to load
-Kokoro can still hold a full lecture.
-
-Live TTS remains only for what cannot be known in advance: spoken answers.
-"""
+"""Pre-fill the disposable narration cache from database lecture artifacts."""
 
 from __future__ import annotations
 
+import argparse
 import json
-import hashlib
-import sys
-from pathlib import Path
 
-import numpy as np
-
+from audio_cache import AudioCache, script_digest
 from campus_imports import configure_campus_imports
-
-# Lecture titles land in log prints; a redirected Windows stdout is cp1252.
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 configure_campus_imports()
 
+from common.db import fetch_all  # noqa: E402
 from common.sentences import split_sentences  # noqa: E402
-
-ROOT = Path(__file__).resolve().parents[1]
-LECTURES_DIR = ROOT / "lectures"
-
-
-def _valid_clip(path: Path) -> bool:
-    try:
-        clip = np.load(path, allow_pickle=False)
-        return clip.dtype == np.float32 and clip.ndim == 1 and clip.size > 0
-    except Exception:
-        return False
-
-
-def _remove_stale_clips(audio_dir: Path, expected: list[Path]) -> None:
-    expected_paths = {path.resolve() for path in expected}
-    for stale in audio_dir.glob("*.npy"):
-        if stale.resolve() not in expected_paths:
-            stale.unlink(missing_ok=True)
-
-
-def _report_progress(
-    book_id: int | None,
-    week: int,
-    total_weeks: int | None,
-    ready_clips: int,
-    total_clips: int,
-) -> None:
-    if book_id is None:
-        return
-    from common.db import execute
-
-    message = (
-        f"Recording lecture audio {week} of {total_weeks or '?'} — "
-        f"{ready_clips}/{total_clips} clips ready…"
-    )
-    execute(
-        """WITH touched_book AS (
-             UPDATE books SET progress = %s, heartbeat_at = CURRENT_TIMESTAMP
-             WHERE id = %s RETURNING id
-           )
-           UPDATE course_generation_milestones
-           SET progress = %s, updated_at = CURRENT_TIMESTAMP
-           WHERE book_id = %s AND week = %s AND stage = 'audio'""",
-        (message, book_id, message, book_id, week),
-    )
+from tts import load_live_engine  # noqa: E402
 
 
 def prerender_all(
     sid: str | None = None,
     week: int | None = None,
-    log=print,
     *,
     book_id: int | None = None,
-    total_weeks: int | None = None,
+    log=print,
 ) -> dict:
-    from tts import load_engine  # imports onnx models — keep at call time
-
-    engine = None
-    sample_rate = None
-    rendered = 0
-    reused = 0
-
-    # Multi-tenant: render this student's course under lectures/<sid>/week-N/.
-    # Without a sid, fall back to the legacy global lectures/week-N/.
-    base = LECTURES_DIR / sid if sid else LECTURES_DIR
-    for folder in sorted(base.glob("week-*")):
-        if week is not None and folder.name != f"week-{week}":
-            continue
-        script_path = folder / "script.json"
-        if not script_path.exists():
-            continue
-        script = json.loads(script_path.read_text("utf-8"))
-        script_sha256 = hashlib.sha256(script_path.read_bytes()).hexdigest()
-        audio_dir = folder / "audio"
-        audio_dir.mkdir(exist_ok=True)
-        expected = [
-            audio_dir / f"s{s_index}-t{t_index}.npy"
-            for s_index, segment in enumerate(script["segments"])
-            for t_index, _sentence in enumerate(split_sentences(segment["text"]))
-        ]
-        meta_path = audio_dir / "meta.json"
-        if meta_path.exists():
-            try:
-                meta = json.loads(meta_path.read_text("utf-8"))
-            except Exception:
-                meta = {}
-            clips_complete = bool(expected) and all(_valid_clip(path) for path in expected)
-            if meta.get("script_sha256") == script_sha256 and clips_complete:
-                _remove_stale_clips(audio_dir, expected)
-                sample_rate = meta.get("sample_rate", sample_rate)
-                _report_progress(book_id, week or 0, total_weeks, len(expected), len(expected))
-                log(f"[prerender] {folder.name}: already complete")
-                continue
-            if not meta.get("script_sha256") and clips_complete:
-                _remove_stale_clips(audio_dir, expected)
-                meta["script_sha256"] = script_sha256
-                temporary_meta = audio_dir / ".meta.json.tmp"
-                temporary_meta.write_text(json.dumps(meta), encoding="utf-8")
-                temporary_meta.replace(meta_path)
-                sample_rate = meta.get("sample_rate", sample_rate)
-                _report_progress(book_id, week or 0, total_weeks, len(expected), len(expected))
-                log(f"[prerender] {folder.name}: adopted complete legacy audio")
-                continue
-            if meta.get("script_sha256") != script_sha256:
-                for stale in audio_dir.glob("*.npy"):
-                    stale.unlink(missing_ok=True)
-            meta_path.unlink(missing_ok=True)
-
-        ready_count = sum(1 for path in expected if _valid_clip(path))
-        _report_progress(book_id, week or 0, total_weeks, ready_count, len(expected))
-        log(f"[prerender] {folder.name}: {script['title']}")
-        if engine is None:
-            engine = load_engine()
-            sample_rate = engine.sample_rate
-        for s_index, segment in enumerate(script["segments"]):
-            for t_index, sentence in enumerate(split_sentences(segment["text"])):
-                target = audio_dir / f"s{s_index}-t{t_index}.npy"
-                if target.exists() and _valid_clip(target):
+    rows = fetch_all(
+        """SELECT artifact_id::text AS artifact_id, student_id, week,
+                  script_payload
+             FROM lecture_artifacts
+            WHERE (%s IS NULL OR student_id = %s)
+              AND (%s IS NULL OR week = %s)
+              AND (%s IS NULL OR book_id = %s)
+            ORDER BY student_id, week""",
+        (sid, sid, week, week, book_id, book_id),
+    )
+    engine = load_live_engine()
+    cache = AudioCache()
+    rendered = reused = 0
+    for row in rows:
+        script = row["script_payload"]
+        digest = script_digest(script)
+        artifact_id = str(row["artifact_id"])
+        for segment_index, segment in enumerate(script["segments"]):
+            for sentence_index, sentence in enumerate(split_sentences(segment["text"])):
+                if cache.load(artifact_id, digest, segment_index, sentence_index) is not None:
                     reused += 1
                     continue
-                temporary = target.with_name(f".{target.name}.tmp.npy")
-                np.save(temporary, engine.render(sentence).astype(np.float32))
-                temporary.replace(target)
+                audio = engine.render(sentence)
+                cache.store(
+                    artifact_id,
+                    digest,
+                    segment_index,
+                    sentence_index,
+                    audio,
+                    engine.sample_rate,
+                )
                 rendered += 1
-                ready_count += 1
-                if ready_count % 10 == 0 or ready_count == len(expected):
-                    _report_progress(book_id, week or 0, total_weeks, ready_count, len(expected))
+        log(f"[prerender] {row['student_id']} week {row['week']} ready")
+    result = {
+        "ok": True,
+        "lectures": len(rows),
+        "rendered": rendered,
+        "reused": reused,
+        "sample_rate": engine.sample_rate,
+    }
+    log(json.dumps(result, sort_keys=True))
+    return result
 
-        _remove_stale_clips(audio_dir, expected)
 
-        temporary_meta = audio_dir / ".meta.json.tmp"
-        temporary_meta.write_text(
-            json.dumps({"sample_rate": engine.sample_rate, "script_sha256": script_sha256}),
-            encoding="utf-8",
-        )
-        temporary_meta.replace(meta_path)
-
-    log(f"[prerender] done: {rendered} new, {reused} reused at {sample_rate or 0} Hz")
-    return {"ok": True, "clips": rendered, "reused": reused, "sample_rate": sample_rate or 0}
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--student")
+    parser.add_argument("--week", type=int)
+    parser.add_argument("--book", type=int)
+    args = parser.parse_args()
+    prerender_all(args.student, args.week, book_id=args.book)
+    return 0
 
 
 if __name__ == "__main__":
-    sid = sys.argv[1] if len(sys.argv) > 1 else None
-    week = int(sys.argv[2]) if len(sys.argv) > 2 else None
-    book_id = int(sys.argv[3]) if len(sys.argv) > 3 else None
-    total_weeks = int(sys.argv[4]) if len(sys.argv) > 4 else None
-    try:
-        print(
-            json.dumps(
-                prerender_all(
-                    sid,
-                    week,
-                    book_id=book_id,
-                    total_weeks=total_weeks,
-                )
-            )
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
-        raise SystemExit(1)
+    raise SystemExit(main())

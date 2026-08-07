@@ -17,7 +17,9 @@ rather than letting a demo fail quietly.
 
 from __future__ import annotations
 
+import ctypes
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -27,7 +29,7 @@ from dotenv import load_dotenv
 from campus_imports import configure_campus_imports
 
 configure_campus_imports()
-from common.device import device, describe  # noqa: E402
+from common.device import cuda_available, device, describe  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
@@ -37,9 +39,8 @@ load_dotenv(ROOT / ".env")
 os.environ.setdefault("COQUI_TOS_AGREED", "1")
 
 TTS_ENGINE = os.getenv("TTS_ENGINE", "kokoro").lower()
-# Live speech (spoken answers) has a student staring at a "Speaking…" stepper;
-# it gets its own engine choice. Pre-rendered lecture audio keeps whatever
-# voice TTS_ENGINE produced — this only decides who talks when time is real.
+# Live speech has a student waiting for each sentence, so it can use a separate
+# low-latency engine choice from TTS_ENGINE.
 TTS_LIVE_ENGINE = os.getenv("TTS_LIVE_ENGINE", "").lower()
 LATENCY_GATE_S = float(os.getenv("TTS_LATENCY_GATE_S", "4.0"))
 
@@ -99,7 +100,7 @@ class PiperTTS(TTSEngine):
                 f"Piper voice not found at {model}. Download one from "
                 "huggingface.co/rhasspy/piper-voices and set PIPER_MODEL."
             )
-        self.voice = PiperVoice.load(str(model), use_cuda=device() == "cuda")
+        self.voice = PiperVoice.load(str(model), use_cuda=_use_piper_cuda())
         self.sample_rate = self.voice.config.sample_rate
         print(f"[tts] Piper '{model.name}' ready ({self.sample_rate} Hz)")
 
@@ -132,6 +133,51 @@ class CoquiTTS(TTSEngine):
 ENGINES = {"kokoro": KokoroTTS, "piper": PiperTTS, "coqui": CoquiTTS}
 
 
+def _use_piper_cuda() -> bool:
+    """Use ONNX CUDA only when explicitly requested and loadable."""
+    preference = os.getenv("PIPER_DEVICE", os.getenv("DEVICE", "auto")).strip().lower()
+    if preference not in {"auto", "cpu", "cuda"}:
+        raise ValueError("PIPER_DEVICE must be one of: auto, cpu, cuda")
+    if preference != "cuda":
+        return False
+    if not cuda_available():
+        print("[tts] Piper CUDA requested but CUDA is unavailable to PyTorch; using CPU")
+        return False
+    return _onnx_cuda_provider_loadable()
+
+
+def _onnx_cuda_provider_loadable() -> bool:
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        print(f"[tts] Piper CUDA requested but ONNX Runtime is unavailable ({exc}); using CPU")
+        return False
+    if "CUDAExecutionProvider" not in ort.get_available_providers():
+        print("[tts] Piper CUDA requested but ONNX Runtime has no CUDA provider; using CPU")
+        return False
+
+    capi = Path(ort.__file__).resolve().parent / "capi"
+    library_name = (
+        "onnxruntime_providers_cuda.dll"
+        if sys.platform == "win32"
+        else "libonnxruntime_providers_cuda.so"
+    )
+    libraries = list(capi.glob(library_name))
+    if not libraries:
+        print("[tts] Piper CUDA requested but its ONNX provider library is missing; using CPU")
+        return False
+    try:
+        if sys.platform == "win32":
+            with os.add_dll_directory(str(capi)):
+                ctypes.WinDLL(str(libraries[0]))
+        else:
+            ctypes.CDLL(str(libraries[0]))
+    except OSError as exc:
+        print(f"[tts] Piper CUDA provider dependencies are unavailable ({exc}); using CPU")
+        return False
+    return True
+
+
 def _measure(engine: TTSEngine) -> float:
     """Render one test sentence and report the real speed. Returns elapsed seconds."""
     started = time.perf_counter()
@@ -147,10 +193,7 @@ def _measure(engine: TTSEngine) -> float:
 
 
 def load_live_engine() -> TTSEngine:
-    """The engine for LIVE speech (answers to questions). Lectures play
-    pre-rendered from disk, so this engine's only job is to never keep a
-    student waiting — TTS_LIVE_ENGINE=piper trades voice richness for 11x
-    realtime while the lecture itself keeps the pre-rendered Kokoro voice."""
+    """Load the low-latency engine used for narration and live answers."""
     if TTS_LIVE_ENGINE and TTS_LIVE_ENGINE in ENGINES and TTS_LIVE_ENGINE != TTS_ENGINE:
         engine: TTSEngine = ENGINES[TTS_LIVE_ENGINE]()
         _measure(engine)

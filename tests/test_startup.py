@@ -1,7 +1,6 @@
-from pathlib import Path
-import json
 import pytest
 
+import startup
 from startup import ArtifactIndex, StartupStage, StartupTrace
 
 
@@ -15,11 +14,11 @@ def test_trace_requires_monotonic_stage_order():
         trace.mark(StartupStage.TRACK_PUBLISHED)
 
 
-def test_artifact_index_fails_closed(tmp_path: Path):
-    folder = tmp_path / "u1" / "week-1"
-    (folder / "audio").mkdir(parents=True)
-    (folder / "script.json").write_text(json.dumps({"title": "L", "segments": []}))
-    (folder / "audio" / "meta.json").write_text(json.dumps({"sample_rate": 24000}))
-    with pytest.raises(FileNotFoundError): ArtifactIndex(tmp_path).require("u1", 1)
-    (folder / "audio" / "s0-t0.npy").write_bytes(b"clip")
-    assert ArtifactIndex(tmp_path).require("u1", 1) == folder
+def test_artifact_index_fails_closed(monkeypatch):
+    monkeypatch.setattr(startup, "_db_fetch_all", lambda _sql: [])
+    monkeypatch.setattr(startup, "_db_fetch_one", lambda _sql, _params: None)
+    with pytest.raises(FileNotFoundError):
+        ArtifactIndex().require("u1", 1)
+
+    monkeypatch.setattr(startup, "_db_fetch_one", lambda _sql, _params: {"exists": 1})
+    assert ArtifactIndex().require("u1", 1) == ("u1", 1)

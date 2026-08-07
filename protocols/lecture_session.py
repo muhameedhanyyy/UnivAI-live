@@ -5,26 +5,30 @@ The LiveKit App mints a token for each lecture room and places a JSON blob in
 that *one* place in the codebase defines the contract between the App team and
 the Live team.
 
-Contract shape (version 1)
+Contract shape (version 2)
 --------------------------
 ::
 
     {
-        "programme_id": "programme-demo-001",
-        "course_id":     "course-demo-001",
-        "plan_version":  1,
-        "week":          1,
-        "lecture_id":    "lecture-week-1",
-        "segments": [
-            {"order": 1, "slide": 0, "text": "Welcome to the lecture."}
-        ]
+        "schema_name":  "univai.live.lecture-session",
+        "schema_version": "2",
+        "artifact_id":  "database-generated-uuid",
+        "learner_id":   "S-2026-000042",
+        "programme_id": "7",
+        "course_id":    "database-generated-uuid",
+        "plan_version": 1,
+        "week":         1,
+        "lecture_id":   "database-generated-uuid",
+        "nonce":        "request-uuid"
     }
 
 Unknown extra keys are ignored (forward-compatible).
 
 Integrated / production mode
 -----------------------------
-All five fields are required.  A missing or empty field raises
+Only identity and lookup fields are accepted. The lecture segments are loaded
+from PostgreSQL by ``artifact_id`` and are never copied through LiveKit room
+metadata. A missing or empty field raises
 ``SessionMetadataError`` immediately — the caller is responsible for publishing
 an actionable error message to the room and stopping the affected feature rather
 than silently substituting defaults.
@@ -41,7 +45,6 @@ This constructor is only accessible when ``runtime_mode()`` returns
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 
 # runtime.py lives in the same directory — import without sys.path games.
@@ -50,7 +53,8 @@ from runtime import RuntimeMode, runtime_mode
 # --------------------------------------------------------------------------- #
 # Schema version recorded in the contract.  Bump this when field names change. #
 # --------------------------------------------------------------------------- #
-METADATA_SCHEMA_VERSION = "1"
+METADATA_SCHEMA = "univai.live.lecture-session"
+METADATA_SCHEMA_VERSION = "2"
 
 # Canonical field names — defined here so tests and validation share one source.
 _REQUIRED_FIELDS = (
@@ -59,7 +63,9 @@ _REQUIRED_FIELDS = (
     "plan_version",
     "week",
     "lecture_id",
-    "segments",
+    "artifact_id",
+    "learner_id",
+    "nonce",
 )
 
 
@@ -101,7 +107,9 @@ class LectureSessionMeta:
     lecture_id: str
     plan_version: int
     week: int
-    segments: tuple[dict[str, int | str], ...]
+    artifact_id: str
+    nonce: str
+    display_name: str | None = None
     sid: str = ""
 
     # ---------------------------------------------------------------------- #
@@ -167,7 +175,13 @@ class LectureSessionMeta:
                 "roomMetadata must be a JSON object.", field="roomMetadata"
             )
 
-        _validate_fields(data, mode)
+        legacy = data.get("schema_version") in {None, "1"}
+        if not legacy:
+            if data.get("schema_name") != METADATA_SCHEMA:
+                raise SessionMetadataError("unsupported lecture metadata schema", field="schema_name")
+            if data.get("schema_version") != METADATA_SCHEMA_VERSION:
+                raise SessionMetadataError("unsupported lecture metadata version", field="schema_version")
+        _validate_fields(data, mode, legacy=legacy)
 
         week = data["week"]
         if not isinstance(week, int) or week < 1:
@@ -187,7 +201,16 @@ class LectureSessionMeta:
                 field="plan_version",
             )
 
-        segments = _validate_segments(data["segments"])
+        learner_id = data.get("learner_id", effective_sid)
+        if learner_id != effective_sid:
+            raise SessionMetadataError(
+                "roomMetadata learner does not own this lecture room.",
+                field="learner_id",
+            )
+        artifact_id = data.get("artifact_id", data["lecture_id"])
+        display_name = data.get("display_name")
+        if display_name is not None and not isinstance(display_name, str):
+            raise SessionMetadataError("display_name must be text or null", field="display_name")
 
         return cls(
             programme_id=data["programme_id"].strip(),
@@ -195,7 +218,9 @@ class LectureSessionMeta:
             lecture_id=data["lecture_id"].strip(),
             plan_version=plan_version,
             week=week,
-            segments=segments,
+            artifact_id=artifact_id.strip(),
+            nonce=str(data.get("nonce", "legacy-room-metadata")).strip(),
+            display_name=display_name.strip() if isinstance(display_name, str) and display_name.strip() else None,
             sid=effective_sid,
         )
 
@@ -223,13 +248,8 @@ class LectureSessionMeta:
             lecture_id="lecture-week-1",
             plan_version=1,
             week=1,
-            segments=(
-                {
-                    "order": 1,
-                    "slide": 0,
-                    "text": "Standalone fixture lecture segment.",
-                },
-            ),
+            artifact_id="standalone-fixture-artifact",
+            nonce="standalone-fixture-nonce",
             sid=sid,
         )
 
@@ -259,15 +279,16 @@ def _sid_from_room_name(room_name: str) -> str:
     return prefix[len("lecture-") :]
 
 
-def _validate_fields(data: dict, mode: RuntimeMode) -> None:
+def _validate_fields(data: dict, mode: RuntimeMode, *, legacy: bool) -> None:
     """Validate that all required string fields are present and non-empty.
 
     In integrated mode every missing or empty field raises immediately.
     In standalone mode the same rules apply when a metadata blob *is* present
     (the caller should use ``standalone_fixture()`` to skip validation).
     """
-    for field in _REQUIRED_FIELDS:
-        if field in {"week", "plan_version", "segments"}:
+    fields = tuple(field for field in _REQUIRED_FIELDS if not legacy or field not in {"artifact_id", "learner_id", "nonce"})
+    for field in fields:
+        if field in {"week", "plan_version"}:
             if field not in data:
                 raise SessionMetadataError(
                     f"roomMetadata is missing required field '{field}'.",
@@ -286,66 +307,22 @@ def _validate_fields(data: dict, mode: RuntimeMode) -> None:
                 field=field,
             )
 
-
-def _validate_segments(value: object) -> tuple[dict[str, int | str], ...]:
-    if not isinstance(value, list) or not value:
-        raise SessionMetadataError(
-            "roomMetadata.segments must be a non-empty array.",
-            field="segments",
-        )
-
-    validated: list[dict[str, int | str]] = []
-    for index, segment in enumerate(value, start=1):
-        if not isinstance(segment, dict):
-            raise SessionMetadataError(
-                f"roomMetadata.segments[{index - 1}] must be an object.",
-                field="segments",
-            )
-        order = segment.get("order")
-        slide = segment.get("slide")
-        text = segment.get("text")
-        if (
-            isinstance(order, bool)
-            or not isinstance(order, int)
-            or order != index
-        ):
-            raise SessionMetadataError(
-                "roomMetadata.segments must use contiguous 1-based order values.",
-                field="segments",
-            )
-        if isinstance(slide, bool) or not isinstance(slide, int) or slide < 0:
-            raise SessionMetadataError(
-                f"roomMetadata.segments[{index - 1}].slide must be a non-negative integer.",
-                field="segments",
-            )
-        if not isinstance(text, str) or not text.strip():
-            raise SessionMetadataError(
-                f"roomMetadata.segments[{index - 1}].text must be non-empty.",
-                field="segments",
-            )
-        validated.append({"order": order, "slide": slide, "text": text.strip()})
-    return tuple(validated)
-
-
 # --------------------------------------------------------------------------- #
 # Canonical fixture metadata string (used in tests and simulator)              #
 # --------------------------------------------------------------------------- #
 
 STANDALONE_ROOM_METADATA: str = json.dumps(
     {
+        "schema_name": METADATA_SCHEMA,
+        "schema_version": METADATA_SCHEMA_VERSION,
         "programme_id": "programme-demo-001",
         "course_id": "course-demo-001",
         "plan_version": 1,
         "week": 1,
         "lecture_id": "lecture-week-1",
-        "segments": [
-            {
-                "order": 1,
-                "slide": 0,
-                "text": "Standalone fixture lecture segment.",
-            }
-        ],
-        "_schema_version": METADATA_SCHEMA_VERSION,
+        "artifact_id": "standalone-fixture-artifact",
+        "learner_id": "S-2026-000042",
+        "nonce": "standalone-fixture-nonce",
     },
     separators=(",", ":"),
 )

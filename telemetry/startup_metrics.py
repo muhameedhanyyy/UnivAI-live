@@ -30,5 +30,27 @@ def summarize(traces: list[dict]) -> dict:
     return result
 
 
+def summarize_audible(events: list[dict]) -> dict:
+    """Summarize browser-confirmed first audio, not server frame capture."""
+    result = {}
+    for mode in ("cold", "warm"):
+        selected = [
+            item for item in events
+            if item.get("schema") == "univai.live.client-first-audio"
+            and item.get("mode") == mode
+            and isinstance(item.get("client_elapsed_ms"), int)
+        ]
+        if len(selected) < 30:
+            raise ValueError(f"{mode} audible startup summary requires at least 30 browser samples")
+        values = sorted(item["client_elapsed_ms"] for item in selected)
+        result[mode] = {
+            "samples": len(values),
+            "p50_ms": _percentile(values, .50),
+            "p95_ms": _percentile(values, .95),
+            "max_ms": max(values),
+        }
+    return result
+
+
 def _percentile(values: list[int], percentile: float) -> int:
     return values[max(0, math.ceil(percentile * len(values)) - 1)]

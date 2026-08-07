@@ -38,14 +38,18 @@ default) and waits for lecture rooms. Logs land in the campus `logs/`.
 Keep `UNIVAI_MODE=integrated` (the default). Missing LiveKit, shared services,
 or model dependencies fail instead of activating fixtures.
 
+Production uses the current Agents `AgentServer` API and must be built from the
+campus root with `docker build -f UnivAI-live/Dockerfile .`. It starts the real
+integrated worker in `start` mode; build `Dockerfile.simulator` explicitly when
+you want the standalone simulator.
+
 ## What's inside
 
 | File | Job |
 |---|---|
-| `worker.py` | the live class: joins `lecture-week-N` rooms, plays the pre-recorded lecture, drives the slides, runs the raise-hand protocol |
+| `worker.py` | the live class: joins lecture and section rooms, loads artifacts from PostgreSQL, synthesizes narration, drives slides, and runs the raise-hand protocol |
 | `qa.py` | a raised-hand question → RAG (the Brain, over MCP) → short spoken answer with page citations |
-| `tts.py` | the voices: Kokoro (rich, used for pre-rendering) and Piper (~10x realtime, used live) |
-| `prerender_audio.py` | records the whole lecture + the personalized raise-hand prompts to disk, so lectures start instantly |
+| `tts.py` | the voices: Kokoro (rich) and Piper (~10x realtime), synthesized on demand |
 | `models/` | the voice model binaries (Kokoro, Piper) — gitignored, fetched by `make models` from the campus root |
 | `stt-project/` | speech-to-text / XTTS research prototypes |
 
@@ -54,7 +58,7 @@ or model dependencies fail instead of activating fixtures.
 - Reads the **campus root `.env`** (LiveKit keys, model paths, student name)
 - Imports the shared plumbing from the campus `services/common/`
   (clock, db, LLM adapter, RAG client)
-- Plays pre-rendered audio from the campus `lectures/week-N/audio/`
+- Loads lecture scripts and section packs from PostgreSQL; no learner lecture folders are read or written
 - STT is faster-whisper; the mic is only *heard* inside the raise-hand window
 
 ## Protocol and safety

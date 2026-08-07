@@ -44,7 +44,7 @@ def test_configures_common_and_services_package_roots(tmp_path: Path):
                 sys.modules[name] = original_modules[name]
 
 
-@pytest.mark.parametrize("entry_point", ["worker.py", "qa.py", "tts.py", "prerender_audio.py"])
+@pytest.mark.parametrize("entry_point", ["worker.py", "qa.py", "tts.py"])
 def test_every_integrated_entry_point_configures_campus_imports(entry_point: str):
     source = (Path(__file__).resolve().parents[1] / entry_point).read_text("utf-8")
     assert "configure_campus_imports()" in source

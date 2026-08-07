@@ -20,15 +20,16 @@ from protocols.lecture_session import (
 
 
 VALID_METADATA: dict = {
+    "schema_name": "univai.live.lecture-session",
+    "schema_version": "2",
     "programme_id": "programme-cs-2026",
     "course_id": "course-ai-101",
     "plan_version": 2,
     "week": 3,
     "lecture_id": "lecture-week-3",
-    "segments": [
-        {"order": 1, "slide": 0, "text": "First segment."},
-        {"order": 2, "slide": 1, "text": "Second segment."},
-    ],
+    "artifact_id": "67a48c60-71b9-42a5-8702-c8351f21b49d",
+    "learner_id": "S-2026-000042",
+    "nonce": "4299f735-7784-4bc5-a146-7100ca10c5a9",
 }
 
 VALID_ROOM_NAME = "lecture-S-2026-000042-week-3"
@@ -70,6 +71,7 @@ class TestFromRoomMetadataIntegrated(unittest.TestCase):
         self.assertEqual(2, result.plan_version)
         self.assertEqual(3, result.week)
         self.assertEqual("lecture-week-3", result.lecture_id)
+        self.assertEqual("67a48c60-71b9-42a5-8702-c8351f21b49d", result.artifact_id)
         self.assertEqual("S-2026-000042", result.sid)
 
     def test_extra_keys_are_ignored(self) -> None:
@@ -145,37 +147,29 @@ class TestFromRoomMetadataIntegrated(unittest.TestCase):
         with self.assertRaises(SessionMetadataError):
             self._run_integrated(run)
 
-    def test_segments_must_be_contiguously_ordered(self) -> None:
-        data = dict(
-            VALID_METADATA,
-            segments=[{"order": 2, "slide": 0, "text": "Out of order."}],
+    def test_segments_are_not_required_or_consumed_from_metadata(self) -> None:
+        data = dict(VALID_METADATA, segments=[{"text": "must come from storage"}])
+        result = self._run_integrated(
+            lambda: LectureSessionMeta.from_room_metadata(VALID_ROOM_NAME, json.dumps(data))
         )
+        self.assertFalse(hasattr(result, "segments"))
 
-        def run():
-            LectureSessionMeta.from_room_metadata(
-                VALID_ROOM_NAME,
-                json.dumps(data),
-            )
-
+    def test_artifact_id_is_required_in_v2(self) -> None:
+        data = dict(VALID_METADATA)
+        del data["artifact_id"]
         with self.assertRaises(SessionMetadataError) as ctx:
-            self._run_integrated(run)
-        self.assertEqual("segments", ctx.exception.field)
-
-    def test_segments_must_contain_spoken_text(self) -> None:
-        data = dict(
-            VALID_METADATA,
-            segments=[{"order": 1, "slide": 0, "text": "   "}],
-        )
-
-        def run():
-            LectureSessionMeta.from_room_metadata(
-                VALID_ROOM_NAME,
-                json.dumps(data),
+            self._run_integrated(
+                lambda: LectureSessionMeta.from_room_metadata(VALID_ROOM_NAME, json.dumps(data))
             )
+        self.assertEqual("artifact_id", ctx.exception.field)
 
+    def test_authenticated_learner_must_own_artifact(self) -> None:
+        data = dict(VALID_METADATA, learner_id="someone-else")
         with self.assertRaises(SessionMetadataError) as ctx:
-            self._run_integrated(run)
-        self.assertEqual("segments", ctx.exception.field)
+            self._run_integrated(
+                lambda: LectureSessionMeta.from_room_metadata(VALID_ROOM_NAME, json.dumps(data))
+            )
+        self.assertEqual("learner_id", ctx.exception.field)
 
 
 class TestFromRoomMetadataStandalone(unittest.TestCase):

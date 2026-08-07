@@ -23,9 +23,11 @@ def parse_room_name(room_name: str) -> tuple[str, int]:
     student_id = prefix[len("lecture-") :]
     if not student_id:
         raise ValueError("room name is missing student identity")
+    if not week_value.isascii() or not week_value.isdecimal():
+        raise ValueError("room week must be a positive integer")
     week = int(week_value)
-    if week not in range(1, 5):
-        raise ValueError("room week must be 1..4")
+    if week < 1:
+        raise ValueError("room week must be a positive integer")
     return student_id, week
 
 
