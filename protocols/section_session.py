@@ -56,7 +56,12 @@ class SectionSessionMetaV1:
     week: int
     lecture_id: str
     plan_version: int
-    lecture_completed: bool
+    # The lecture's scheduled end has passed. Not "the learner sat through it":
+    # completion is only recorded when the Lecturer reaches the last line with
+    # the learner present, so requiring it meant leaving a lecture early
+    # forfeited that week's section for good. A section opens on the clock,
+    # exactly like the week's quiz, and the App gates on the same rule.
+    lecture_ended: bool
     pack: dict[str, Any]
     schema_name: str = SECTION_META_SCHEMA
     schema_version: str = SECTION_META_VERSION
@@ -72,7 +77,7 @@ class SectionSessionMetaV1:
         week: int,
         lecture_id: str,
         plan_version: int,
-        lecture_completed: bool,
+        lecture_ended: bool,
         pack: object,
     ) -> "SectionSessionMetaV1":
         payload = {
@@ -85,7 +90,7 @@ class SectionSessionMetaV1:
             "week": week,
             "lecture_id": lecture_id,
             "plan_version": plan_version,
-            "lecture_completed": lecture_completed,
+            "lecture_ended": lecture_ended,
             "pack": pack,
         }
         return cls.from_room_metadata(
@@ -111,8 +116,8 @@ class SectionSessionMetaV1:
             raise SectionContractError("week must be a positive integer", field="week")
         if isinstance(version, bool) or not isinstance(version, int) or version < 1:
             raise SectionContractError("plan_version must be a positive integer", field="plan_version")
-        if data.get("lecture_completed") is not True:
-            raise SectionContractError("the linked lecture must be completed before its section", field="lecture_completed")
+        if data.get("lecture_ended") is not True:
+            raise SectionContractError("the linked lecture has not ended yet", field="lecture_ended")
         pack = validate_section_pack(data.get("pack"))
         expected = {
             "user_id": learner,
@@ -136,7 +141,7 @@ class SectionSessionMetaV1:
             week=week,
             lecture_id=expected["topic_id"],
             plan_version=version,
-            lecture_completed=True,
+            lecture_ended=True,
             pack=pack,
         )
 

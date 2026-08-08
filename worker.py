@@ -913,10 +913,22 @@ async def _run_section(ctx: agents.JobContext, raw_meta: str, trace: StartupTrac
             row = await asyncio.wait_for(
                 asyncio.to_thread(
                     fetch_one,
+                    # A section opens on the clock, like the week's quiz. The
+                    # 45-120 clamp with a 60-minute legacy default mirrors the
+                    # App's scriptDurationMinutes, so both gates agree to the
+                    # minute on when a lecture ended.
                     """SELECT sp.programme_id, p.name AS programme_title,
                               sp.course_id, sp.week, sp.lecture_id,
                               sp.approved_plan_version, sp.pack_payload,
-                              (a.completed_at IS NOT NULL) AS lecture_completed
+                              (now() + ((SELECT offset_ms FROM clock_state WHERE id = 1)
+                                        || ' milliseconds')::interval)
+                                >= l.starts_at
+                                   + (CASE WHEN (la.script_payload->>'durationMinutes') ~ '^[0-9]+$'
+                                            AND (la.script_payload->>'durationMinutes')::int
+                                                BETWEEN 45 AND 120
+                                           THEN (la.script_payload->>'durationMinutes')::int
+                                           ELSE 60 END || ' minutes')::interval
+                                AS lecture_ended
                          FROM section_packs sp
                          JOIN programmes p ON p.id::text = sp.programme_id
                           AND p.student_id = sp.tenant_id
@@ -924,8 +936,8 @@ async def _run_section(ctx: agents.JobContext, raw_meta: str, trace: StartupTrac
                           AND p.plan_version = sp.approved_plan_version
                          JOIN lectures l ON l.student_id = sp.tenant_id
                           AND l.week = sp.week
-                         LEFT JOIN attendance a ON a.lecture_id = l.id
-                          AND a.student_id = sp.tenant_id
+                         LEFT JOIN lecture_artifacts la
+                           ON la.artifact_id = l.lecture_artifact_id
                         WHERE sp.tenant_id = %s AND sp.section_pack_id = %s
                         LIMIT 1""",
                     (learner_id, reference.section_pack_id),
@@ -942,7 +954,7 @@ async def _run_section(ctx: agents.JobContext, raw_meta: str, trace: StartupTrac
                 week=int(row["week"]),
                 lecture_id=str(row["lecture_id"]),
                 plan_version=int(row["approved_plan_version"]),
-                lecture_completed=bool(row["lecture_completed"]),
+                lecture_ended=bool(row["lecture_ended"]),
                 pack=row["pack_payload"],
             )
         else:
