@@ -16,7 +16,7 @@ def metadata():
     return {
         "schema_name": "univai.section-session-meta", "schema_version": "1.0.0",
         "learner_id": "u1", "programme_id": "p1", "programme_title": "Programme", "course_id": "c1", "week": 2,
-        "lecture_id": "lecture-2", "plan_version": 4, "lecture_completed": True,
+        "lecture_id": "lecture-2", "plan_version": 4, "lecture_ended": True,
         "pack": {"schema_name": "univai.section.pack", "schema_version": "1.0.0", "session_type": "section",
                  "user_id": "u1", "programme_title": "Programme", "course_id": "c1", "week_number": 2, "topic_id": "lecture-2", "plan_version": "4", "title": "Practice",
                  "activities": [{"order": 1, "title": "Try", "description": "Solve", "citations": [citation()]}],
@@ -33,9 +33,9 @@ def test_exact_identity_and_provenance_are_required():
         SectionSessionMetaV1.from_room_metadata(json.dumps(bad), authenticated_learner_id="u1")
 
 
-def test_section_requires_completed_lecture_and_owner():
-    bad = metadata(); bad["lecture_completed"] = False
-    with pytest.raises(SectionContractError, match="completed"):
+def test_section_requires_an_ended_lecture_and_owner():
+    bad = metadata(); bad["lecture_ended"] = False
+    with pytest.raises(SectionContractError, match="has not ended"):
         SectionSessionMetaV1.from_room_metadata(json.dumps(bad), authenticated_learner_id="u1")
     with pytest.raises(SectionContractError, match="own"):
         SectionSessionMetaV1.from_room_metadata(json.dumps(metadata()), authenticated_learner_id="u2")
@@ -63,7 +63,7 @@ def test_v2_room_metadata_is_only_a_storage_reference():
         week=stored["week"],
         lecture_id=stored["lecture_id"],
         plan_version=stored["plan_version"],
-        lecture_completed=stored["lecture_completed"],
+        lecture_ended=stored["lecture_ended"],
         pack=stored["pack"],
     )
     assert meta.pack["title"] == "Practice"
