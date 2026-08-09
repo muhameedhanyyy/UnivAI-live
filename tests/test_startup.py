@@ -1,7 +1,10 @@
+import asyncio
+import time
+
 import pytest
 
 import startup
-from startup import ArtifactIndex, StartupStage, StartupTrace
+from startup import ArtifactIndex, LazyDependencies, StartupStage, StartupTrace
 
 
 def test_trace_requires_monotonic_stage_order():
@@ -22,3 +25,25 @@ def test_artifact_index_fails_closed(monkeypatch):
 
     monkeypatch.setattr(startup, "_db_fetch_one", lambda _sql, _params: {"exists": 1})
     assert ArtifactIndex().require("u1", 1) == ("u1", 1)
+
+
+def test_concurrent_stt_waiters_share_one_model_load(monkeypatch):
+    calls = 0
+    model = object()
+
+    def load():
+        nonlocal calls
+        calls += 1
+        time.sleep(.03)
+        return model
+
+    monkeypatch.setattr(LazyDependencies, "_load_stt", staticmethod(load))
+
+    async def scenario():
+        dependencies = LazyDependencies()
+        left, right = await asyncio.gather(dependencies.stt(), dependencies.stt())
+        assert left is model and right is model
+        assert await dependencies.stt() is model
+
+    asyncio.run(scenario())
+    assert calls == 1

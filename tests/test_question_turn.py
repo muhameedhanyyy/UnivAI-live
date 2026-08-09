@@ -64,3 +64,18 @@ def test_invalid_environment_is_rejected(monkeypatch):
     monkeypatch.setenv("QUESTION_FINAL_SILENCE_MS", "800")
     with pytest.raises(ValueError, match="QUESTION_FINAL_SILENCE_MS"):
         TurnConfig.from_env()
+
+
+def test_explicit_mute_never_waits_for_no_speech_timeout_and_empty_stt_can_be_typed():
+    async def scenario():
+        clock = Clock()
+        controller = QuestionTurnController(clock=clock, id_factory=lambda: "A")
+        controller.start(); controller.listen(); controller.request_mute()
+        clock.advance(.3)
+        assert controller.endpoint_reason() == "mic_muted"
+        assert await controller.finalize("mic_muted") == ""
+        assert controller.state is TurnState.REVIEW
+        assert controller.transcript == ""
+        assert controller.confirm("typed fallback question") == "typed fallback question"
+
+    asyncio.run(scenario())

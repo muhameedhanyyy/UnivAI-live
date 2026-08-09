@@ -114,19 +114,22 @@ class QuestionTurnController:
         return True
 
     def request_mute(self) -> None:
-        if self.state is TurnState.LISTENING and self.turn.first_speech_ms is not None:
+        # Muting is an explicit end-of-turn signal even when VAD did not detect
+        # the learner.  The old first-speech guard left quiet microphones stuck
+        # in LISTENING until the full 30-second no-speech timeout.
+        if self.state is TurnState.LISTENING:
             self.turn.mute_requested_ms = self._now_ms()
 
     def endpoint_reason(self) -> str | None:
         if self.state is not TurnState.LISTENING:
             return None
         now = self._now_ms()
+        if self.turn.mute_requested_ms is not None and now - self.turn.mute_requested_ms >= self.config.mute_drain_ms:
+            return "mic_muted"
         if self.turn.first_speech_ms is None:
             return "no_speech" if now - self.turn.started_ms >= self.config.first_speech_timeout_ms else None
         if now - self.turn.first_speech_ms >= self.config.max_duration_ms:
             return "max_duration"
-        if self.turn.mute_requested_ms is not None and now - self.turn.mute_requested_ms >= self.config.mute_drain_ms:
-            return "mic_muted"
         if self.turn.last_speech_ms is not None and now - self.turn.last_speech_ms >= self.config.final_silence_ms:
             return "final_silence"
         return None
@@ -148,8 +151,13 @@ class QuestionTurnController:
         transcript = _normalize(" ".join(fragments))
         self.turn.tasks.clear()
         if not transcript:
-            await self.close("stt_empty")
-            return None
+            # Speech was attempted but recognition produced no words. Keep the
+            # lecture paused and open the existing review box empty so the
+            # learner can type instead of silently losing their turn.
+            self.transcript = ""
+            self._transition(TurnState.REVIEW, "stt_empty")
+            self.review_ready.set()
+            return ""
         self.transcript = transcript
         self._transition(TurnState.REVIEW, reason_code)
         self.review_ready.set()

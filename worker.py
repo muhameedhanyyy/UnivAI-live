@@ -60,6 +60,11 @@ from question_turn import QuestionTurnController, TurnState  # noqa: E402
 from resilience.fallbacks import choose_fallback  # noqa: E402
 from resilience.timeouts import Stage, StageTimeout, within_budget  # noqa: E402
 from audio_cache import AudioCache, script_digest  # noqa: E402
+from microphone_tracks import (  # noqa: E402
+    existing_learner_microphones,
+    is_learner_microphone,
+    track_key,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
@@ -185,12 +190,19 @@ class LectureSession:
     async def send(self, message: dict) -> None:
         if self.closed:
             return
-        try:
-            await self.room.local_participant.publish_data(
-                json.dumps(message).encode("utf-8"), reliable=True
-            )
-        except Exception:
-            self.closed = True
+        payload = json.dumps(message).encode("utf-8")
+        for attempt in range(2):
+            try:
+                await self.room.local_participant.publish_data(payload, reliable=True)
+                return
+            except Exception as exc:
+                if attempt == 0:
+                    await asyncio.sleep(0.1)
+                else:
+                    # A transient data-channel failure must not kill audio or
+                    # mark the whole lecture closed. The room lifecycle events
+                    # below are the source of truth for disconnects.
+                    log(f"[live-data] send failed after retry: {type(exc).__name__}")
 
     # -- speaking ---------------------------------------------------------------
 
@@ -304,6 +316,8 @@ class LectureSession:
             print(f"[tts] deferred engine warmup failed: {engine}")
             return
         self.tts = engine
+        if len(results) > 1 and isinstance(results[1], BaseException):
+            log(f"[stt] deferred warmup failed: {type(results[1]).__name__}: {results[1]}")
         rendered = await asyncio.gather(
             *(self.render(text) for text in PROMPT_TEXTS.values()),
             return_exceptions=True,
@@ -451,6 +465,11 @@ class LectureSession:
         answered = False
         if unmuted:
             self.question_turn.listen()
+            # The learner can tap mute again between the unmute event waking us
+            # and LISTENING starting. Preserve that explicit end signal instead
+            # of waiting 30 seconds for speech on an already-muted track.
+            if not self.mic_unmuted.is_set():
+                self.question_turn.request_mute()
             self.hand_active = True
             try:
                 answered = await self.collect_and_answer()
@@ -480,6 +499,13 @@ class LectureSession:
             await self.send({"type": "progress", "stage": "problem", "detail": "No complete question was captured. Please raise your hand and try again."})
             return False
         heard = self.question_turn.transcript or ""
+
+        if not heard:
+            await self.send({
+                "type": "progress",
+                "stage": "problem",
+                "detail": "I could not transcribe that clearly. Type your question in the review box, then send it.",
+            })
 
         # Nothing is asked on the student's behalf. We show them what we heard and
         # they send it, edit it first, or throw it away.
@@ -581,108 +607,183 @@ class LectureSession:
         return True
 
 
-async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model) -> None:
-    """The Listener agent: VAD for barge-in, faster-whisper for the question.
+async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model, vad_model=None) -> None:
+    """Consume one authenticated microphone track with probabilistic VAD + STT.
 
-    Everything heavy here runs in a thread. Loading or running Whisper on the
-    event loop stalls the Lecturer's audio pump, which sounds exactly like the
-    lecture dying twenty seconds in — because it does.
+    Silero decides whether a frame is speech instead of relying on a fixed
+    volume threshold. A lightweight energy fallback remains available if the
+    VAD model cannot load. Model loading and transcription are both included in
+    the learner-facing STT budget, and CPU work stays off the event loop.
     """
     from collections import deque
+    from livekit.agents.vad import VADEventType
 
     stream = rtc.AudioStream(track, sample_rate=16000, num_channels=1)
     buffer: list[np.ndarray] = []
-    # Pre-roll: the VAD only fires AFTER you have been talking for a moment, so
-    # without this ring the first syllables were cut off — Whisper then heard a
-    # clipped fragment and often returned nothing. That was the biggest reason
-    # "the mic recording does not catch".
-    preroll: deque[np.ndarray] = deque(maxlen=50)  # ~0.5 s at 10 ms frames
+    preroll: deque[np.ndarray] = deque(maxlen=50)  # about 0.5 s
     speech_ms = 0.0
     silence_ms = 0.0
     capturing = False
-    # Adaptive threshold: a fixed 0.02 RMS misses quiet microphones entirely.
-    # Track the noise floor and trigger a few times above it instead.
-    noise_floor = 0.004
+    gate_open = False
+    noise_floor = 0.0005
+    flush_lock = asyncio.Lock()
+    vad_stream = vad_model.stream() if vad_model is not None else None
+    vad_consumer: asyncio.Task | None = None
 
     async def transcribe(audio: np.ndarray) -> str:
-        resolved_model = await session.dependencies.stt() if session.dependencies else model
-        if resolved_model is None:
-            return ""
-        def run_stt() -> str:
-            segments, _info = resolved_model.transcribe(audio, language="en")
-            return " ".join(seg.text.strip() for seg in segments).strip()
+        async def resolve_and_run() -> str:
+            resolved_model = await session.dependencies.stt() if session.dependencies else model
+            if resolved_model is None:
+                raise RuntimeError("STT model is unavailable")
+
+            def run_stt() -> str:
+                segments, _info = resolved_model.transcribe(
+                    audio,
+                    language="en",
+                    vad_filter=False,
+                    condition_on_previous_text=False,
+                )
+                return " ".join(seg.text.strip() for seg in segments).strip()
+
+            return await asyncio.to_thread(run_stt)
+
+        started = time.perf_counter()
         try:
-            return await within_budget(Stage.STT, asyncio.to_thread(run_stt))
+            text = await within_budget(Stage.STT, resolve_and_run())
+            log(
+                f"[listener] STT of {len(audio) / 16000:.1f}s audio took "
+                f"{time.perf_counter() - started:.2f}s"
+            )
+            return text
         except StageTimeout:
             await session.send(choose_fallback("stt", "stt_timeout").event())
+            await session.send({
+                "type": "progress",
+                "stage": "problem",
+                "detail": "Voice recognition took too long. Type your question in the review box.",
+            })
+            return ""
+        except Exception as exc:
+            log(f"[stt] recognition failed: {type(exc).__name__}: {exc}")
+            await session.send(choose_fallback("stt", "stt_unavailable").event())
+            await session.send({
+                "type": "progress",
+                "stage": "problem",
+                "detail": "Voice recognition is unavailable. Type your question in the review box.",
+            })
             return ""
 
     async def flush_segment() -> None:
-        nonlocal buffer, capturing, speech_ms
-        if not buffer or not session.question_turn.turn_id:
-            return
-        audio = np.concatenate(buffer)
-        buffer, capturing, speech_ms = [], False, 0
-        preroll.clear()
-        session.question_turn.add_stt(session.question_turn.turn_id, transcribe(audio))
+        nonlocal buffer, capturing, speech_ms, silence_ms
+        async with flush_lock:
+            if not buffer or not session.question_turn.turn_id:
+                return
+            audio = np.concatenate(buffer)
+            buffer, capturing, speech_ms, silence_ms = [], False, 0, 0
+            preroll.clear()
+            turn_id = session.question_turn.turn_id
+            if session.question_turn.add_stt(turn_id, transcribe(audio)):
+                log(f"[listener] queued {len(audio) / 16000:.1f}s for STT (turn={turn_id})")
 
     session.flush_capture = flush_segment
 
-    async for event in stream:
-        frame = event.frame
-        samples = np.frombuffer(frame.data, dtype=np.int16).astype(np.float32) / 32768.0
-        frame_ms = len(samples) / 16000 * 1000
-
-        rms = float(np.sqrt(np.mean(samples**2)))
-        threshold = min(0.02, max(0.006, noise_floor * 3.5))
-        loud = rms > threshold
-        if not loud:
-            noise_floor = 0.95 * noise_floor + 0.05 * rms
-
-        if loud:
-            speech_ms += frame_ms
-            silence_ms = 0
-        else:
-            silence_ms += frame_ms
-
-        # Only the raise-hand window records anything: outside it the student is
-        # muted anyway, and stray noise must never derail the lecture. The same
-        # gate holds while the LECTURER is speaking — an open mic next to
-        # speakers would otherwise feed our own voice back into Whisper.
-        if not session.hand_active or session.speaking:
-            preroll.append(samples)
-            buffer, capturing, speech_ms = [], False, 0
-            continue
-
-        if loud:
-            session.question_turn.observe_speech()
-
-        if not capturing:
-            preroll.append(samples)
-
-        if not capturing and speech_ms >= SPEECH_TRIGGER_MS:
-            capturing = True
-            buffer = list(preroll)      # include the syllables from BEFORE the trigger
-            print(f"[listener] capturing (threshold {threshold:.3f})")
-
-        if capturing:
-            buffer.append(samples)
-
-            if silence_ms >= SILENCE_END_MS:
+    async def consume_probabilities() -> None:
+        nonlocal buffer, capturing
+        assert vad_stream is not None
+        async for vad_event in vad_stream:
+            if not session.hand_active or session.speaking:
+                continue
+            if vad_event.type == VADEventType.START_OF_SPEECH:
+                session.question_turn.observe_speech()
+                if not capturing:
+                    capturing = True
+                    buffer = list(preroll)
+                    log(f"[listener] speech started (probability={vad_event.probability:.2f})")
+            elif vad_event.type == VADEventType.INFERENCE_DONE and vad_event.probability >= 0.5:
+                session.question_turn.observe_speech()
+            elif vad_event.type == VADEventType.END_OF_SPEECH:
                 await flush_segment()
 
-        reason = session.question_turn.endpoint_reason()
-        if reason:
-            if buffer:
-                await flush_segment()
-            await session.question_turn.finalize(reason)
+    if vad_stream is not None:
+        vad_consumer = asyncio.create_task(
+            consume_probabilities(),
+            name=f"vad-{track_key(track)}",
+        )
 
-        if not capturing and silence_ms > 1000:
-            speech_ms = 0
+    try:
+        async for event in stream:
+            frame = event.frame
+            samples = np.frombuffer(frame.data, dtype=np.int16).astype(np.float32) / 32768.0
+            frame_ms = len(samples) / 16000 * 1000
+            active = session.hand_active and not session.speaking
+
+            # Reset at every capture-window boundary so lecturer echo and old
+            # noise never leak into the learner's next question.
+            if not active:
+                if gate_open and vad_stream is not None:
+                    vad_stream.flush()
+                gate_open = False
+                preroll.clear()
+                buffer, capturing, speech_ms, silence_ms = [], False, 0, 0
+                continue
+            if not gate_open:
+                gate_open = True
+                if vad_stream is not None:
+                    vad_stream.flush()
+
+            if not capturing:
+                preroll.append(samples)
+            else:
+                buffer.append(samples)
+
+            if vad_stream is not None:
+                vad_stream.push_frame(frame)
+                continue
+
+            # Degraded fallback for installations where Silero failed to load.
+            # Its low floor avoids the old self-reinforcing 0.014 threshold that
+            # treated many laptop microphones as permanent silence.
+            rms = float(np.sqrt(np.mean(samples**2)))
+            threshold = min(0.02, max(0.0015, noise_floor * 2.2 + 0.0004))
+            loud = rms > threshold
+            if not loud:
+                noise_floor = 0.98 * noise_floor + 0.02 * rms
+                silence_ms += frame_ms
+                if not capturing and silence_ms >= 150:
+                    speech_ms = 0
+            else:
+                session.question_turn.observe_speech()
+                speech_ms += frame_ms
+                silence_ms = 0
+
+            if not capturing and speech_ms >= SPEECH_TRIGGER_MS:
+                capturing = True
+                buffer = list(preroll)
+                log(f"[listener] energy fallback started (threshold={threshold:.4f})")
+            if capturing and silence_ms >= SILENCE_END_MS:
+                await flush_segment()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log(f"[listener] microphone stream failed: {type(exc).__name__}: {exc}")
+        await session.send({
+            "type": "progress",
+            "stage": "problem",
+            "detail": "The microphone connection was interrupted. Mute once to finish, or type your question.",
+        })
+    finally:
+        if session.flush_capture is flush_segment:
+            session.flush_capture = None
+        if vad_stream is not None:
+            await vad_stream.aclose()
+        if vad_consumer is not None:
+            if not vad_consumer.done():
+                vad_consumer.cancel()
+            await asyncio.gather(vad_consumer, return_exceptions=True)
 
 
 def prewarm(proc: agents.JobProcess) -> None:
-    """Initialize only cheap state required to accept a LiveKit job."""
+    """Initialize shared state once per worker process."""
     proc.userdata["tts"] = None
     proc.userdata["dependencies"] = LazyDependencies()
     proc.userdata["audio_cache"] = AudioCache()
@@ -694,6 +795,24 @@ def prewarm(proc: agents.JobProcess) -> None:
     proc.userdata["prompt_cache"] = PromptCache(Path(os.getenv("PROMPT_CACHE_DIR", str(Path(__file__).parent / ".prompt-cache"))))
 
     proc.userdata["stt"] = None
+
+    # Energy thresholds vary wildly between laptop microphones. Silero uses a
+    # speech probability and is loaded once here so each room can create a cheap
+    # isolated stream. Failure degrades to the energy fallback in listen().
+    try:
+        from livekit.plugins import silero
+
+        proc.userdata["vad"] = silero.VAD.load(
+            min_speech_duration=0.2,
+            min_silence_duration=SILENCE_END_MS / 1000,
+            prefix_padding_duration=0.5,
+            max_buffered_speech=60.0,
+            activation_threshold=0.5,
+        )
+        log("[vad] Silero ready")
+    except Exception as exc:
+        proc.userdata["vad"] = None
+        log(f"[vad] Silero unavailable; using energy fallback: {type(exc).__name__}: {exc}")
 
 
 def _startup_mode() -> str:
@@ -820,11 +939,93 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         for key, audio in prompt_bank.items()
     }
     stt_model = ctx.proc.userdata["stt"]
+    vad_model = ctx.proc.userdata.get("vad")
+    listener_tasks: dict[str, asyncio.Task] = {}
+
+    def start_listener(
+        track: rtc.Track,
+        publication: object,
+        participant: object,
+    ) -> None:
+        if not is_learner_microphone(
+            track,
+            publication,
+            participant,
+            sid,
+            audio_kind=rtc.TrackKind.KIND_AUDIO,
+            microphone_source=rtc.TrackSource.SOURCE_MICROPHONE,
+        ):
+            return
+        key = track_key(track)
+        existing = listener_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            listen(session, track, stt_model, vad_model),
+            name=f"listen-{key}",
+        )
+        listener_tasks[key] = task
+
+        def listener_done(done: asyncio.Task) -> None:
+            listener_tasks.pop(key, None)
+            if not done.cancelled() and (error := done.exception()) is not None:
+                log(f"[listener] task failed: {type(error).__name__}: {error}")
+
+        task.add_done_callback(listener_done)
+        log(f"[listener] microphone attached (track={key}, learner={sid})")
+
+    def stop_listener(track: rtc.Track) -> None:
+        task = listener_tasks.pop(track_key(track), None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def mark_microphone_unmuted() -> None:
+        session.mic_unmuted.set()
+
+    def mark_microphone_muted() -> None:
+        session.mic_unmuted.clear()
+        session.question_turn.request_mute()
+        turn_id = session.question_turn.turn_id
+
+        async def finalize_after_drain() -> None:
+            await asyncio.sleep(session.question_turn.config.mute_drain_ms / 1000)
+            if turn_id != session.question_turn.turn_id or session.question_turn.state is not TurnState.LISTENING:
+                return
+            if session.flush_capture:
+                await session.flush_capture()
+            reason = session.question_turn.endpoint_reason()
+            if reason == "mic_muted":
+                await session.question_turn.finalize(reason)
+
+        asyncio.create_task(finalize_after_drain(), name=f"mute-drain-{turn_id}")
 
     @ctx.room.on("track_subscribed")
-    def on_track(track: rtc.Track, *_: object) -> None:
-        if track.kind == rtc.TrackKind.KIND_AUDIO:
-            asyncio.create_task(listen(session, track, stt_model))
+    def on_track(track: rtc.Track, publication: object, participant: object) -> None:
+        start_listener(track, publication, participant)
+
+    @ctx.room.on("track_unsubscribed")
+    def on_track_unsubscribed(track: rtc.Track, *_: object) -> None:
+        stop_listener(track)
+
+    @ctx.room.on("track_unmuted")
+    def on_track_unmuted(publication: object, participant: object) -> None:
+        track = getattr(publication, "track", None)
+        if is_learner_microphone(
+            track, publication, participant, sid,
+            audio_kind=rtc.TrackKind.KIND_AUDIO,
+            microphone_source=rtc.TrackSource.SOURCE_MICROPHONE,
+        ):
+            mark_microphone_unmuted()
+
+    @ctx.room.on("track_muted")
+    def on_track_muted(publication: object, participant: object) -> None:
+        track = getattr(publication, "track", None)
+        if is_learner_microphone(
+            track, publication, participant, sid,
+            audio_kind=rtc.TrackKind.KIND_AUDIO,
+            microphone_source=rtc.TrackSource.SOURCE_MICROPHONE,
+        ):
+            mark_microphone_muted()
 
     @ctx.room.on("data_received")
     def on_data(packet: rtc.DataPacket) -> None:
@@ -853,21 +1054,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             session.hand_raised.set()
         elif message.get("type") == "mic":
             if message.get("muted"):
-                session.mic_unmuted.clear()
-                session.question_turn.request_mute()
-                turn_id = session.question_turn.turn_id
-                async def finalize_after_drain() -> None:
-                    await asyncio.sleep(session.question_turn.config.mute_drain_ms / 1000)
-                    if turn_id != session.question_turn.turn_id or session.question_turn.state is not TurnState.LISTENING:
-                        return
-                    if session.flush_capture:
-                        await session.flush_capture()
-                    reason = session.question_turn.endpoint_reason()
-                    if reason == "mic_muted":
-                        await session.question_turn.finalize(reason)
-                asyncio.create_task(finalize_after_drain())
+                mark_microphone_muted()
             else:
-                session.mic_unmuted.set()
+                mark_microphone_unmuted()
         elif message.get("type") == "startup_audio_playing":
             elapsed = message.get("client_elapsed_ms")
             if isinstance(elapsed, (int, float)) and 0 <= elapsed <= 60_000:
@@ -884,7 +1073,41 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     @ctx.room.on("disconnected")
     def on_disconnected(*_: object) -> None:
+        session.closed = True
+        session.interrupted.set()
+        for task in tuple(listener_tasks.values()):
+            task.cancel()
         asyncio.create_task(session.question_turn.close("disconnect"))
+
+    @ctx.room.on("participant_disconnected")
+    def on_participant_disconnected(participant: object) -> None:
+        if getattr(participant, "identity", None) != sid:
+            return
+        session.closed = True
+        session.interrupted.set()
+        for task in tuple(listener_tasks.values()):
+            task.cancel()
+        asyncio.create_task(session.question_turn.close("learner_left"))
+
+    @ctx.room.on("reconnecting")
+    def on_reconnecting(*_: object) -> None:
+        log("[live] room connection interrupted; LiveKit is reconnecting")
+
+    @ctx.room.on("reconnected")
+    def on_reconnected(*_: object) -> None:
+        log("[live] room reconnected")
+
+    # The learner can publish immediately after their browser connects while
+    # this worker is still loading metadata. LiveKit does not replay an earlier
+    # track_subscribed event, so attach both event-time and already-existing
+    # microphone publications. start_listener de-duplicates the race.
+    for existing in existing_learner_microphones(
+        ctx.room,
+        sid,
+        audio_kind=rtc.TrackKind.KIND_AUDIO,
+        microphone_source=rtc.TrackSource.SOURCE_MICROPHONE,
+    ):
+        start_listener(*existing)
 
     await session.run()
 
@@ -1051,7 +1274,10 @@ async def _run_section(ctx: agents.JobContext, raw_meta: str, trace: StartupTrac
             await controller.complete()
 
 
-server = agents.AgentServer(initialize_process_timeout=10.0)
+# Silero is loaded once in setup_fnc and takes several seconds on Windows/CPU.
+# Give process initialization an honest bound instead of intermittently killing
+# a healthy worker at the old ten-second edge.
+server = agents.AgentServer(initialize_process_timeout=30.0)
 server.setup_fnc = prewarm
 # Keep this worker unnamed so rooms receive automatic dispatch. Naming an agent
 # opts into explicit dispatch, which the UnivAI token routes do not request.

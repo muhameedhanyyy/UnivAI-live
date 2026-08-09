@@ -111,6 +111,7 @@ class LazyDependencies:
         # post-first-frame warm task loads the same model a second time.
         self._tts = tts
         self._stt = None
+        self._stt_task: asyncio.Task | None = None
         self._tts_lock = asyncio.Lock()
         self._stt_lock = asyncio.Lock()
 
@@ -122,15 +123,43 @@ class LazyDependencies:
         return self._tts
 
     async def stt(self):
+        # Keep one shared model load alive even if a learner-facing timeout
+        # cancels its waiter.  Cancelling asyncio.to_thread cannot stop the
+        # underlying model load; without this task cache, every retry started a
+        # second Whisper model and could exhaust RAM.
         async with self._stt_lock:
-            if self._stt is None:
-                from common.device import whisper_settings
-                from faster_whisper import WhisperModel
-                import os
-                device, compute_type = whisper_settings()
-                size = os.getenv("STT_MODEL_SIZE", "base")
-                self._stt = await asyncio.to_thread(WhisperModel, size, device=device, compute_type=compute_type)
+            if self._stt is not None:
+                return self._stt
+            if self._stt_task is None:
+                self._stt_task = asyncio.create_task(
+                    asyncio.to_thread(self._load_stt),
+                    name="load-whisper-model",
+                )
+            task = self._stt_task
+
+        try:
+            model = await asyncio.shield(task)
+        except BaseException:
+            async with self._stt_lock:
+                if self._stt_task is task and task.done():
+                    self._stt_task = None
+            raise
+
+        async with self._stt_lock:
+            self._stt = model
+            if self._stt_task is task:
+                self._stt_task = None
         return self._stt
+
+    @staticmethod
+    def _load_stt():
+        from common.device import whisper_settings
+        from faster_whisper import WhisperModel
+        import os
+
+        device, compute_type = whisper_settings()
+        size = os.getenv("STT_MODEL_SIZE", "base")
+        return WhisperModel(size, device=device, compute_type=compute_type)
 
     async def warm(self) -> list:
         return await asyncio.gather(self.tts(), self.stt(), return_exceptions=True)
