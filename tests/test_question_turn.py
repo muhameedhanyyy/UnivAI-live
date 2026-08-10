@@ -55,8 +55,9 @@ def test_late_cancel_timeout_and_protocol_messages_never_confirm():
         controller.start(); controller.listen()
         assert not controller.add_stt("A", asyncio.sleep(0, result="stale words"))
         clock.advance(30); assert controller.endpoint_reason() == "no_speech"
-        assert await controller.finalize("no_speech") is None
-        assert controller.state is TurnState.CLOSED and controller.transcript is None
+        assert await controller.finalize("no_speech") == ""
+        assert controller.state is TurnState.REVIEW and controller.transcript == ""
+        assert controller.review_reason == "no_speech"
     asyncio.run(scenario())
 
 
@@ -77,5 +78,33 @@ def test_explicit_mute_never_waits_for_no_speech_timeout_and_empty_stt_can_be_ty
         assert controller.state is TurnState.REVIEW
         assert controller.transcript == ""
         assert controller.confirm("typed fallback question") == "typed fallback question"
+
+    asyncio.run(scenario())
+
+
+def test_processing_is_bounded_and_an_empty_turn_can_retry_or_cancel():
+    async def never_finishes():
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    async def scenario():
+        clock = Clock()
+        controller = QuestionTurnController(
+            config=TurnConfig(processing_timeout_ms=5),
+            clock=clock,
+            id_factory=iter(("A", "B")).__next__,
+        )
+        controller.start(); controller.listen(); controller.observe_speech()
+        controller.add_stt("A", never_finishes())
+        assert await controller.finalize("final_silence") == ""
+        assert controller.state is TurnState.REVIEW
+        assert controller.review_reason == "processing_timeout"
+
+        assert await controller.retry() == "B"
+        assert controller.state is TurnState.LISTENING
+        assert controller.transcript is None
+        assert controller.review_reason is None
+        assert await controller.cancel()
+        assert controller.state is TurnState.CLOSED
 
     asyncio.run(scenario())

@@ -7,7 +7,7 @@ import unittest
 
 os.environ["UNIVAI_MODE"] = "standalone"
 
-from protocol import parse_room_name, validate_inbound, validate_script
+from protocol import parse_room_name, validate_inbound, validate_outbound, validate_script
 from runtime import REPOSITORY_ROOT
 from simulate import fixture_answer, run_simulation
 
@@ -33,6 +33,11 @@ class LiveSimulatorTests(unittest.TestCase):
         validate_script(script)
         with self.assertRaises(ValueError):
             validate_inbound({"type": "question", "text": ""})
+        validate_inbound({"type": "retry"})
+        validate_outbound({"type": "state", "state": "processing"})
+        validate_outbound({"type": "speech", "state": "detected", "detail": "heard"})
+        with self.assertRaises(ValueError):
+            validate_outbound({"type": "speech", "state": "stuck"})
 
     def test_complete_interaction_trace(self) -> None:
         messages = asyncio.run(run_simulation(trace=False))

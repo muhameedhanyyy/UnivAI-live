@@ -8,12 +8,14 @@ STATES = {
     "lecturing",
     "asking",
     "listening",
+    "processing",
     "review",
     "answering",
     "ended",
 }
-INBOUND_TYPES = {"raise_hand", "mic", "question", "cancel"}
-OUTBOUND_TYPES = {"slide", "state", "answer", "transcript", "progress", "hand"}
+SPEECH_STATES = {"waiting", "detected", "processing", "received", "no_speech", "error"}
+INBOUND_TYPES = {"raise_hand", "mic", "question", "retry", "cancel"}
+OUTBOUND_TYPES = {"slide", "state", "answer", "transcript", "progress", "hand", "speech", "fallback"}
 
 
 def parse_room_name(room_name: str) -> tuple[str, int]:
@@ -75,3 +77,9 @@ def validate_outbound(message: dict) -> None:
         raise ValueError("slide.n must be a positive integer")
     if kind == "hand" and message.get("state") not in {"acked", "lowered"}:
         raise ValueError("hand.state must be acked or lowered")
+    if kind == "speech":
+        if message.get("state") not in SPEECH_STATES:
+            raise ValueError("unknown speech state")
+        detail = message.get("detail")
+        if detail is not None and (not isinstance(detail, str) or len(detail) > 300):
+            raise ValueError("speech.detail must contain at most 300 characters")

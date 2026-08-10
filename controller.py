@@ -44,9 +44,14 @@ class LectureController:
         if self.muted:
             await self.receive({"type": "mic", "muted": False})
         await self.send({"type": "state", "state": "listening"})
+        await self.send({"type": "speech", "state": "waiting", "detail": "Speak now."})
         question = self.pending_question or "What protects each learner's material?"
+        await self.send({"type": "speech", "state": "detected", "detail": "I can hear you."})
+        await self.send({"type": "state", "state": "processing"})
+        await self.send({"type": "speech", "state": "processing", "detail": "Turning your speech into text."})
         await self.send({"type": "state", "state": "review"})
         await self.send({"type": "transcript", "text": question})
+        await self.send({"type": "speech", "state": "received", "detail": "Your transcript is ready."})
         await self.send(
             {"type": "progress", "stage": "retrieving", "detail": "fixture"}
         )

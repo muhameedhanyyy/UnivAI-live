@@ -178,10 +178,13 @@ class LectureSession:
         self.prompts: dict[str, np.ndarray] = {}
         # What Whisper heard. It is shown in the browser for the student to correct.
         self.heard: asyncio.Queue[str] = asyncio.Queue()
-        # What the student actually confirmed (possibly edited). "" means they cancelled.
-        self.confirmed: asyncio.Queue[str] = asyncio.Queue()
+        # Review actions are explicit so retry/cancel cannot be mistaken for a
+        # learner's question or leak into the next turn.
+        self.review_actions: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self.question_turn = QuestionTurnController()
+        self.question_finalize_lock = asyncio.Lock()
         self.flush_capture = None
+        self.stt_problem: tuple[str, str] | None = None
         self.speaking = False
         self.closed = False          # the student left; stop talking to an empty room
 
@@ -436,11 +439,20 @@ class LectureSession:
                 append_trace(Path(trace_path), payload)
 
     async def _wait_for_unmute(self, seconds: float) -> bool:
-        try:
-            await asyncio.wait_for(self.mic_unmuted.wait(), timeout=seconds)
-            return True
-        except asyncio.TimeoutError:
-            return False
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.question_turn.state is TurnState.CLOSED:
+                return False
+            if self.mic_unmuted.is_set():
+                return True
+            try:
+                await asyncio.wait_for(
+                    self.mic_unmuted.wait(),
+                    timeout=min(0.2, max(0.01, deadline - time.monotonic())),
+                )
+            except asyncio.TimeoutError:
+                continue
+        return self.mic_unmuted.is_set()
 
     async def handle_hand(self) -> None:
         """The raise-hand protocol, exactly as specified:
@@ -458,7 +470,7 @@ class LectureSession:
         await self.send({"type": "hand", "state": "acked"})
 
         unmuted = await self._wait_for_unmute(4.0)
-        if not unmuted:
+        if not unmuted and self.question_turn.state is not TurnState.CLOSED:
             await self._play_prompt("remind")
             unmuted = await self._wait_for_unmute(8.0)
 
@@ -484,46 +496,121 @@ class LectureSession:
             # No question came. Lower the hand and catch the room's attention.
             await self._play_prompt("resume")
 
+    async def finalize_question_turn(self, reason: str) -> bool:
+        """Flush and finalize exactly once, regardless of silence/mute races."""
+        async with self.question_finalize_lock:
+            if self.question_turn.state is not TurnState.LISTENING:
+                return False
+            # A VAD END event can arrive just after the final-silence timer.
+            # Flush first so valid final words are never discarded.
+            if reason != "no_speech" and self.flush_capture:
+                await self.flush_capture()
+            if self.question_turn.state is not TurnState.LISTENING:
+                return False
+            self.hand_active = False
+            if reason != "no_speech":
+                await self.send({"type": "state", "state": "processing"})
+                await self.send({
+                    "type": "speech",
+                    "state": "processing",
+                    "detail": "Speech received. Turning it into text now.",
+                })
+            await self.question_turn.finalize(reason)
+            return True
+
     async def collect_and_answer(self) -> bool:
         """Capture the question, let the student edit the transcript, answer it.
         Returns False when nothing was ultimately asked."""
-        await self.send({"type": "state", "state": "listening"})
+        while not self.review_actions.empty():
+            self.review_actions.get_nowait()
 
-        while not self.question_turn.review_ready.is_set():
-            reason = self.question_turn.endpoint_reason()
-            if reason:
-                await self.question_turn.finalize(reason)
-                break
-            await asyncio.sleep(0.05)
-        if self.question_turn.state is not TurnState.REVIEW:
-            await self.send({"type": "progress", "stage": "problem", "detail": "No complete question was captured. Please raise your hand and try again."})
-            return False
-        heard = self.question_turn.transcript or ""
-
-        if not heard:
+        while True:
+            self.stt_problem = None
+            self.hand_active = True
+            await self.send({"type": "state", "state": "listening"})
             await self.send({
-                "type": "progress",
-                "stage": "problem",
-                "detail": "I could not transcribe that clearly. Type your question in the review box, then send it.",
+                "type": "speech",
+                "state": "waiting",
+                "detail": (
+                    "Listening now. Start speaking, then pause or mute when you are done. "
+                    f"I will wait {self.question_turn.config.first_speech_timeout_ms // 1000} seconds for speech."
+                ),
             })
 
-        # Nothing is asked on the student's behalf. We show them what we heard and
-        # they send it, edit it first, or throw it away.
-        await self.send({"type": "state", "state": "review"})
-        await self.send({"type": "transcript", "text": heard})
-        log(f"[question-turn] stage=review turn_id={self.question_turn.turn_id}")
+            while not self.question_turn.review_ready.is_set():
+                reason = self.question_turn.endpoint_reason()
+                if reason:
+                    if await self.finalize_question_turn(reason):
+                        break
+                await asyncio.sleep(0.05)
 
-        try:
-            question = await asyncio.wait_for(self.confirmed.get(), timeout=REVIEW_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            print("[lecture] no confirmation - resuming the lecture")
-            await self.send({"type": "transcript", "text": None})
-            await self.question_turn.close("review_timeout")
-            return False
+            self.hand_active = False
+            if self.question_turn.state is not TurnState.REVIEW:
+                # Cancel closes the turn and wakes this loop. It is expected.
+                if self.question_turn.state is not TurnState.CLOSED:
+                    await self.send({
+                        "type": "speech",
+                        "state": "error",
+                        "detail": "The voice turn could not finish. Please raise your hand and try again.",
+                    })
+                return False
 
-        if not question.strip():          # they cancelled
-            print("[lecture] question cancelled")
-            return False
+            heard = self.question_turn.transcript or ""
+            review_reason = self.question_turn.review_reason or "stt_empty"
+
+            # Nothing is asked on the student's behalf. Show the transcript, or
+            # an empty box with clear type/retry/cancel choices.
+            await self.send({"type": "state", "state": "review"})
+            await self.send({"type": "transcript", "text": heard})
+            if heard:
+                detail = (
+                    "Transcript ready. One part timed out, so check it carefully before sending."
+                    if review_reason == "partial_timeout" or self.stt_problem
+                    else "Transcript ready. Check it before sending."
+                )
+                await self.send({"type": "speech", "state": "received", "detail": detail})
+            else:
+                if self.stt_problem:
+                    speech_state, detail = "error", self.stt_problem[1]
+                elif review_reason == "processing_timeout":
+                    speech_state, detail = (
+                        "error",
+                        "Voice recognition took too long. Type your question or try the microphone again.",
+                    )
+                elif review_reason == "no_speech":
+                    speech_state, detail = (
+                        "no_speech",
+                        "I did not hear speech. Check the microphone, type your question, or try again.",
+                    )
+                else:
+                    speech_state, detail = (
+                        "no_speech",
+                        "I could not recognize clear words. Type your question or try the microphone again.",
+                    )
+                await self.send({"type": "speech", "state": speech_state, "detail": detail})
+            log(f"[question-turn] stage=review turn_id={self.question_turn.turn_id}")
+
+            try:
+                action, value = await asyncio.wait_for(
+                    self.review_actions.get(),
+                    timeout=REVIEW_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                print("[lecture] no confirmation - resuming the lecture")
+                await self.send({"type": "transcript", "text": None})
+                await self.question_turn.close("review_timeout")
+                return False
+
+            if action == "retry":
+                await self.send({"type": "transcript", "text": None})
+                if await self.question_turn.retry() is None:
+                    return False
+                continue
+            if action == "cancel":
+                print("[lecture] question cancelled")
+                return False
+            question = value
+            break
 
         # The question is in — the capture window's job is done. Closing it now
         # keeps the student's still-open mic (or its echo of OUR answer) from
@@ -630,7 +717,7 @@ async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model, va
     vad_stream = vad_model.stream() if vad_model is not None else None
     vad_consumer: asyncio.Task | None = None
 
-    async def transcribe(audio: np.ndarray) -> str:
+    async def transcribe(turn_id: str, audio: np.ndarray) -> str:
         async def resolve_and_run() -> str:
             resolved_model = await session.dependencies.stt() if session.dependencies else model
             if resolved_model is None:
@@ -656,6 +743,11 @@ async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model, va
             )
             return text
         except StageTimeout:
+            if session.question_turn.turn_id == turn_id:
+                session.stt_problem = (
+                    "stt_timeout",
+                    "Voice recognition took too long. Type your question or try the microphone again.",
+                )
             await session.send(choose_fallback("stt", "stt_timeout").event())
             await session.send({
                 "type": "progress",
@@ -665,6 +757,11 @@ async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model, va
             return ""
         except Exception as exc:
             log(f"[stt] recognition failed: {type(exc).__name__}: {exc}")
+            if session.question_turn.turn_id == turn_id:
+                session.stt_problem = (
+                    "stt_unavailable",
+                    "Voice recognition is unavailable. Type your question or try the microphone again.",
+                )
             await session.send(choose_fallback("stt", "stt_unavailable").event())
             await session.send({
                 "type": "progress",
@@ -682,7 +779,7 @@ async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model, va
             buffer, capturing, speech_ms, silence_ms = [], False, 0, 0
             preroll.clear()
             turn_id = session.question_turn.turn_id
-            if session.question_turn.add_stt(turn_id, transcribe(audio)):
+            if session.question_turn.add_stt(turn_id, transcribe(turn_id, audio)):
                 log(f"[listener] queued {len(audio) / 16000:.1f}s for STT (turn={turn_id})")
 
     session.flush_capture = flush_segment
@@ -694,13 +791,25 @@ async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model, va
             if not session.hand_active or session.speaking:
                 continue
             if vad_event.type == VADEventType.START_OF_SPEECH:
-                session.question_turn.observe_speech()
+                first_speech = session.question_turn.observe_speech()
+                if first_speech:
+                    await session.send({
+                        "type": "speech",
+                        "state": "detected",
+                        "detail": "I can hear you. Keep speaking until your question is complete.",
+                    })
                 if not capturing:
                     capturing = True
                     buffer = list(preroll)
                     log(f"[listener] speech started (probability={vad_event.probability:.2f})")
             elif vad_event.type == VADEventType.INFERENCE_DONE and vad_event.probability >= 0.5:
-                session.question_turn.observe_speech()
+                first_speech = session.question_turn.observe_speech()
+                if first_speech:
+                    await session.send({
+                        "type": "speech",
+                        "state": "detected",
+                        "detail": "I can hear you. Keep speaking until your question is complete.",
+                    })
             elif vad_event.type == VADEventType.END_OF_SPEECH:
                 await flush_segment()
 
@@ -752,7 +861,13 @@ async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model, va
                 if not capturing and silence_ms >= 150:
                     speech_ms = 0
             else:
-                session.question_turn.observe_speech()
+                first_speech = session.question_turn.observe_speech()
+                if first_speech:
+                    await session.send({
+                        "type": "speech",
+                        "state": "detected",
+                        "detail": "I can hear you. Keep speaking until your question is complete.",
+                    })
                 speech_ms += frame_ms
                 silence_ms = 0
 
@@ -766,11 +881,18 @@ async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model, va
         raise
     except Exception as exc:
         log(f"[listener] microphone stream failed: {type(exc).__name__}: {exc}")
+        if session.question_turn.state is TurnState.LISTENING:
+            session.stt_problem = (
+                "microphone_interrupted",
+                "The microphone connection was interrupted. Type your question or try the microphone again.",
+            )
         await session.send({
             "type": "progress",
             "stage": "problem",
-            "detail": "The microphone connection was interrupted. Mute once to finish, or type your question.",
+            "detail": "The microphone connection was interrupted. Type your question or try the microphone again.",
         })
+        if session.question_turn.state is TurnState.LISTENING:
+            await session.finalize_question_turn("stream_error")
     finally:
         if session.flush_capture is flush_segment:
             session.flush_capture = None
@@ -991,11 +1113,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             await asyncio.sleep(session.question_turn.config.mute_drain_ms / 1000)
             if turn_id != session.question_turn.turn_id or session.question_turn.state is not TurnState.LISTENING:
                 return
-            if session.flush_capture:
-                await session.flush_capture()
             reason = session.question_turn.endpoint_reason()
             if reason == "mic_muted":
-                await session.question_turn.finalize(reason)
+                await session.finalize_question_turn(reason)
 
         asyncio.create_task(finalize_after_drain(), name=f"mute-drain-{turn_id}")
 
@@ -1040,11 +1160,20 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         if message.get("type") == "question":
             confirmed = session.question_turn.confirm(str(message.get("text", "")))
             if confirmed is not None:
-                session.confirmed.put_nowait(confirmed)
+                session.review_actions.put_nowait(("question", confirmed))
+        elif message.get("type") == "retry":
+            if session.question_turn.state is TurnState.REVIEW:
+                session.review_actions.put_nowait(("retry", ""))
         elif message.get("type") == "cancel":
             async def cancel_review() -> None:
+                state = session.question_turn.state
+                if state is TurnState.IDLE and session.hand_raised.is_set():
+                    session.hand_raised.clear()
+                    await session.send({"type": "hand", "state": "lowered"})
+                    return
                 if await session.question_turn.cancel():
-                    session.confirmed.put_nowait("")
+                    if state is TurnState.REVIEW:
+                        session.review_actions.put_nowait(("cancel", ""))
             asyncio.create_task(cancel_review())
         elif message.get("type") == "raise_hand":
             if session.question_turn.state not in {TurnState.IDLE, TurnState.CLOSED}:

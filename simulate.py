@@ -61,13 +61,14 @@ def smoke() -> int:
     states = {
         message["state"] for message in messages if message["type"] == "state"
     }
-    required_kinds = {"slide", "state", "progress", "transcript", "answer", "hand"}
+    required_kinds = {"slide", "state", "progress", "transcript", "answer", "hand", "speech"}
     required_states = {
         "connecting",
         "preparing",
         "lecturing",
         "asking",
         "listening",
+        "processing",
         "review",
         "answering",
         "ended",

@@ -27,8 +27,9 @@ class TurnConfig:
     segment_boundary_ms: int = 800
     final_silence_ms: int = 2500
     mute_drain_ms: int = 300
-    first_speech_timeout_ms: int = 30000
+    first_speech_timeout_ms: int = 15000
     max_duration_ms: int = 45000
+    processing_timeout_ms: int = 12000
 
     @classmethod
     def from_env(cls) -> "TurnConfig":
@@ -36,8 +37,9 @@ class TurnConfig:
             segment_boundary_ms=_bounded("QUESTION_SEGMENT_MS", 800, 200, 1500),
             final_silence_ms=_bounded("QUESTION_FINAL_SILENCE_MS", 2500, 1500, 6000),
             mute_drain_ms=_bounded("QUESTION_MUTE_DRAIN_MS", 300, 100, 1000),
-            first_speech_timeout_ms=_bounded("QUESTION_FIRST_SPEECH_MS", 30000, 5000, 60000),
+            first_speech_timeout_ms=_bounded("QUESTION_FIRST_SPEECH_MS", 15000, 5000, 60000),
             max_duration_ms=_bounded("QUESTION_MAX_DURATION_MS", 45000, 10000, 90000),
+            processing_timeout_ms=_bounded("QUESTION_PROCESSING_MS", 12000, 5000, 30000),
         )
 
 
@@ -69,6 +71,7 @@ class QuestionTurnController:
         self.protocol_violations: list[str] = []
         self.review_ready = asyncio.Event()
         self.transcript: str | None = None
+        self.review_reason: str | None = None
 
     @property
     def state(self) -> TurnState:
@@ -84,6 +87,7 @@ class QuestionTurnController:
             return None
         self.review_ready = asyncio.Event()
         self.transcript = None
+        self.review_reason = None
         self.turn = _Turn(self.id_factory(), self._now_ms())
         self.metrics.append(TurnMetric(self.turn.turn_id, TurnState.IDLE, 0))
         self._transition(TurnState.ACKNOWLEDGED)
@@ -96,13 +100,15 @@ class QuestionTurnController:
         self._transition(TurnState.LISTENING)
         return True
 
-    def observe_speech(self) -> None:
+    def observe_speech(self) -> bool:
         if self.state is not TurnState.LISTENING:
-            return
+            return False
         now = self._now_ms()
+        first = self.turn.first_speech_ms is None
         if self.turn.first_speech_ms is None:
             self.turn.first_speech_ms = now
         self.turn.last_speech_ms = now
+        return first
 
     def add_stt(self, turn_id: str, result: Awaitable[str]) -> bool:
         if self.state is not TurnState.LISTENING or turn_id != self.turn_id:
@@ -138,28 +144,53 @@ class QuestionTurnController:
         if self.state is not TurnState.LISTENING:
             self._violation("finalize_out_of_state")
             return None
-        if reason_code in {"no_speech", "max_duration"} and (reason_code == "no_speech" or not self.turn.tasks):
-            await self.close(reason_code)
-            return None
         self._transition(TurnState.FINALIZING, reason_code)
         turn_id = self.turn.turn_id
-        results = await asyncio.gather(*self.turn.tasks, return_exceptions=True)
+        tasks = list(self.turn.tasks)
+        timed_out = False
+        if tasks:
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=self.config.processing_timeout_ms / 1000,
+            )
+            timed_out = bool(pending)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            results: list[str | BaseException] = []
+            for task in tasks:
+                if task not in done or task.cancelled():
+                    continue
+                try:
+                    results.append(task.result())
+                except BaseException as exc:
+                    results.append(exc)
+        else:
+            results = []
         if self.turn is None or self.turn.turn_id != turn_id or self.state is TurnState.CLOSED:
             self._violation("stale_result")
             return None
         fragments = [value.strip() for value in results if isinstance(value, str) and value.strip()]
         transcript = _normalize(" ".join(fragments))
         self.turn.tasks.clear()
+        self.review_reason = (
+            "partial_timeout"
+            if timed_out and transcript
+            else "processing_timeout"
+            if timed_out
+            else reason_code
+        )
         if not transcript:
-            # Speech was attempted but recognition produced no words. Keep the
-            # lecture paused and open the existing review box empty so the
-            # learner can type instead of silently losing their turn.
+            # No speech, a muted turn, and STT failures all land in a visible
+            # review state. The learner can type, retry the microphone, or
+            # cancel; the lecture never silently resumes under them.
             self.transcript = ""
-            self._transition(TurnState.REVIEW, "stt_empty")
+            self._transition(TurnState.REVIEW, self.review_reason or "stt_empty")
             self.review_ready.set()
             return ""
         self.transcript = transcript
-        self._transition(TurnState.REVIEW, reason_code)
+        self._transition(TurnState.REVIEW, self.review_reason)
         self.review_ready.set()
         return transcript
 
@@ -176,11 +207,27 @@ class QuestionTurnController:
         return normalized
 
     async def cancel(self) -> bool:
-        if self.state is not TurnState.REVIEW:
+        if self.state not in {
+            TurnState.ACKNOWLEDGED,
+            TurnState.LISTENING,
+            TurnState.FINALIZING,
+            TurnState.REVIEW,
+        }:
             self._violation("cancel_out_of_state")
             return False
         await self.close("cancelled")
         return True
+
+    async def retry(self) -> str | None:
+        """Start a clean capture attempt after an empty or incorrect review."""
+        if self.state is not TurnState.REVIEW:
+            self._violation("retry_out_of_state")
+            return None
+        await self.close("retry")
+        turn_id = self.start()
+        if turn_id is not None:
+            self.listen()
+        return turn_id
 
     async def close(self, reason_code: str = "completed") -> None:
         if not self.turn:
