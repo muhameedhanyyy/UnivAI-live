@@ -56,7 +56,7 @@ def test_prewarm_is_idempotent_and_tenant_isolated(tmp_path: Path, monkeypatch):
     first = cache.prewarm(learner_id="opaque-m", display_name="Mohamed Hany", **args)
     cache.prewarm(learner_id="opaque-m", display_name="Mohamed Hany", **args)
     cache.prewarm(learner_id="opaque-s", display_name="Sara Ali", **args)
-    assert renders == 6
+    assert renders == 8
     assert first.normalized_name_digest not in str(tmp_path)
     assert "Mohamed" not in str(list(tmp_path.rglob("*")))
 

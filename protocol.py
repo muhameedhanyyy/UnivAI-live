@@ -5,6 +5,8 @@ from __future__ import annotations
 STATES = {
     "connecting",
     "preparing",
+    "waiting",
+    "resuming",
     "lecturing",
     "asking",
     "listening",
@@ -14,7 +16,7 @@ STATES = {
     "ended",
 }
 SPEECH_STATES = {"waiting", "detected", "processing", "received", "no_speech", "error"}
-INBOUND_TYPES = {"raise_hand", "mic", "question", "retry", "cancel"}
+INBOUND_TYPES = {"raise_hand", "mic", "question", "retry", "cancel", "presence"}
 OUTBOUND_TYPES = {"slide", "state", "answer", "transcript", "progress", "hand", "speech", "fallback"}
 
 
@@ -63,6 +65,8 @@ def validate_inbound(message: dict) -> None:
         text = message.get("text")
         if not isinstance(text, str) or not text.strip() or len(text) > 500:
             raise ValueError("question.text must contain 1..500 characters")
+    if kind == "presence" and message.get("state") not in {"present", "leaving"}:
+        raise ValueError("presence.state must be present or leaving")
 
 
 def validate_outbound(message: dict) -> None:

@@ -19,6 +19,12 @@ State machine (exactly as specified):
     MUTED        the student's mic is muted client-side, so VAD never fires and
                  the lecture is never interrupted.
 
+    WAITING      learner presence disappeared; persist attended time and stop
+                 emitting narration until that authenticated learner returns.
+
+    RESUMING     play the prepared welcome clip, rewind three completed
+                 sentences for context, then continue from the durable checkpoint.
+
 Run:  python UnivAI-live/worker.py dev   (from the UnivAI campus root)
 """
 
@@ -49,6 +55,7 @@ from dotenv import load_dotenv
 from livekit import agents, rtc
 
 from common.device import whisper_settings, describe  # noqa: E402
+from common.clock import now as virtual_now  # noqa: E402
 from common.sentences import split_sentences  # noqa: E402
 from protocols.lecture_session import LectureSessionMeta, SessionMetadataError  # noqa: E402
 from qa import TROUBLE, answer_question  # noqa: E402
@@ -60,6 +67,12 @@ from question_turn import QuestionTurnController, TurnState  # noqa: E402
 from resilience.fallbacks import choose_fallback  # noqa: E402
 from resilience.timeouts import Stage, StageTimeout, within_budget  # noqa: E402
 from audio_cache import AudioCache, script_digest  # noqa: E402
+from lecture_progress import (  # noqa: E402
+    LectureAdmissionClosed,
+    LectureProgressRepository,
+    replay_start,
+)
+from personalization import render_templates  # noqa: E402
 from microphone_tracks import (  # noqa: E402
     existing_learner_microphones,
     is_learner_microphone,
@@ -80,10 +93,13 @@ STT_MODEL_SIZE = os.getenv("STT_MODEL_SIZE", "base")
 SPEECH_TRIGGER_MS = 300     # this much speech from the student = a barge-in
 SILENCE_END_MS = 800        # this much silence = they have finished asking
 REVIEW_TIMEOUT_S = 120      # how long we hold the lecture while they edit the transcript
+PRESENCE_HEARTBEAT_S = 3.0
+PRESENCE_TIMEOUT_S = 12.0
 PROMPT_TEXTS = {
     "ask": "Yes? Do you have a question? Unmute your microphone and go ahead.",
     "remind": "Your hand is still raised. Unmute whenever you are ready; I am listening.",
     "resume": "No question? No problem. Alright everyone, eyes back on the slides, and let us continue!",
+    "rejoin": "Welcome back. I am continuing from three sentences before where we stopped.",
 }
 
 
@@ -110,6 +126,9 @@ class Lecture:
     week: int
     title: str
     segments: list[dict]
+    # Internal FK used only when persisting Q&A. Public/session identifiers stay
+    # opaque at the API boundary.
+    internal_id: int | None = None
     # The owner (studentId). Scopes RAG retrieval for live Q&A and the qa_log.
     sid: str = ""
     artifact_id: str = ""
@@ -124,7 +143,7 @@ class Lecture:
     ) -> "Lecture":
         from common.db import fetch_one
         row = fetch_one(
-            """SELECT la.script_payload FROM lectures l
+            """SELECT l.id AS internal_id, la.script_payload FROM lectures l
                  JOIN lecture_artifacts la ON la.artifact_id = l.lecture_artifact_id
                 WHERE l.student_id = %s AND l.week = %s
                   AND la.artifact_id = %s::uuid""",
@@ -141,6 +160,7 @@ class Lecture:
             week=week,
             title=script["title"],
             segments=segments,
+            internal_id=int(row["internal_id"]),
             sid=sid,
             artifact_id=artifact_id,
             script_digest=digest,
@@ -176,6 +196,7 @@ class LectureSession:
         self.mic_unmuted = asyncio.Event()
         self.hand_active = False             # capture window: only now does the Listener record
         self.prompts: dict[str, np.ndarray] = {}
+        self.prompt_texts = dict(PROMPT_TEXTS)
         # What Whisper heard. It is shown in the browser for the student to correct.
         self.heard: asyncio.Queue[str] = asyncio.Queue()
         # Review actions are explicit so retry/cancel cannot be mistaken for a
@@ -187,6 +208,19 @@ class LectureSession:
         self.stt_problem: tuple[str, str] | None = None
         self.speaking = False
         self.closed = False          # the student left; stop talking to an empty room
+        # LiveKit participant events provide the fast path. Browser heartbeats
+        # cover half-open network connections where no disconnect event arrives.
+        self.learner_present = asyncio.Event()
+        self.presence_lock = asyncio.Lock()
+        self.last_presence_signal = 0.0
+        self._attendance_tick: float | None = None
+        self.previously_admitted = False
+        if lecture.internal_id is None:
+            raise ValueError("the live lecture is missing its persisted database id")
+        self.progress = LectureProgressRepository(
+            lecture_id=lecture.internal_id,
+            learner_id=lecture.sid,
+        )
 
     # -- outbound messages to the browser --------------------------------------
 
@@ -274,7 +308,7 @@ class LectureSession:
             for start in range(0, len(audio), frame_size):
                 if interruptible and self.interrupted.is_set():
                     return False
-                if self.closed:
+                if self.closed or not self.learner_present.is_set():
                     return False
 
                 pcm = (np.clip(audio[start : start + frame_size], -1.0, 1.0) * 32767).astype(
@@ -313,30 +347,145 @@ class LectureSession:
 
     async def _warm_after_first_frame(self) -> None:
         """Prepare interaction models and prompts after narration is audible."""
-        results = await self.dependencies.warm()
-        engine = results[0]
-        if isinstance(engine, BaseException):
-            print(f"[tts] deferred engine warmup failed: {engine}")
-            return
-        self.tts = engine
-        if len(results) > 1 and isinstance(results[1], BaseException):
-            log(f"[stt] deferred warmup failed: {type(results[1]).__name__}: {results[1]}")
-        rendered = await asyncio.gather(
-            *(self.render(text) for text in PROMPT_TEXTS.values()),
-            return_exceptions=True,
-        )
-        for key, audio in zip(PROMPT_TEXTS, rendered):
-            if isinstance(audio, np.ndarray) and len(audio):
-                self.prompts[key] = audio
+        stt_task = asyncio.create_task(self.dependencies.stt(), name="warm-stt-after-audio")
+        try:
+            self.tts = await self.dependencies.tts()
+            # Prepare the personalized welcome immediately. Whisper can take
+            # much longer to load and must not delay this reconnect clip.
+            rendered = await asyncio.gather(
+                *(self.render(text) for text in self.prompt_texts.values()),
+                return_exceptions=True,
+            )
+            for key, audio in zip(self.prompt_texts, rendered):
+                if isinstance(audio, np.ndarray) and len(audio):
+                    self.prompts[key] = audio
+        except Exception as exc:
+            print(f"[tts] deferred prompt warmup failed: {exc}")
+        try:
+            await stt_task
+        except Exception as exc:
+            log(f"[stt] deferred warmup failed: {type(exc).__name__}: {exc}")
 
-    async def _play_prompt(self, key: str) -> None:
+    async def _prepare_prompt(self, key: str) -> np.ndarray:
         audio = self.prompts.get(key)
         if audio is None:
-            audio = await self.render(PROMPT_TEXTS[key])
+            audio = await self.render(self.prompt_texts[key])
             if len(audio):
                 self.prompts[key] = audio
+        return audio
+
+    async def _play_prompt(self, key: str) -> bool:
+        audio = await self._prepare_prompt(key)
         if len(audio):
-            await self.play(audio, interruptible=False)
+            return await self.play(audio, interruptible=False)
+        return False
+
+    def _consume_attended_seconds(self) -> float:
+        """Measure real connected time with a monotonic clock.
+
+        Virtual time controls lecture windows, but an administrator jumping the
+        course clock must not manufacture hours of learner attendance.
+        """
+
+        if self._attendance_tick is None:
+            return 0.0
+        current = asyncio.get_running_loop().time()
+        elapsed = max(0.0, current - self._attendance_tick)
+        self._attendance_tick = current
+        return elapsed
+
+    async def learner_arrived(self) -> bool:
+        """Mark a real participant connection. True means this was a rejoin."""
+
+        async with self.presence_lock:
+            loop = asyncio.get_running_loop()
+            was_absent = not self.learner_present.is_set()
+            self.last_presence_signal = loop.time()
+            if not was_absent:
+                return False
+            arrived_at = await asyncio.to_thread(virtual_now)
+            try:
+                first_admission = await asyncio.to_thread(
+                    self.progress.ensure_joined,
+                    arrived_at,
+                )
+            except LectureAdmissionClosed:
+                await self.send({
+                    "type": "progress",
+                    "stage": "problem",
+                    "detail": "The first-join window for this lecture has closed.",
+                })
+                self.closed = True
+                self.interrupted.set()
+                return False
+            self.previously_admitted = not first_admission
+            await asyncio.to_thread(self.progress.mark_present, arrived_at)
+            self._attendance_tick = loop.time()
+            self.learner_present.set()
+            return True
+
+    async def learner_heartbeat(self) -> None:
+        loop = asyncio.get_running_loop()
+        self.last_presence_signal = loop.time()
+        if not self.learner_present.is_set():
+            await self.learner_arrived()
+
+    async def learner_departed(self, reason: str) -> bool:
+        async with self.presence_lock:
+            if not self.learner_present.is_set():
+                return False
+            elapsed = self._consume_attended_seconds()
+            self._attendance_tick = None
+            self.learner_present.clear()
+            self.hand_raised.clear()
+            self.hand_active = False
+            self.mic_unmuted.clear()
+            disconnected_at = await asyncio.to_thread(virtual_now)
+            await asyncio.to_thread(self.progress.mark_absent, elapsed, disconnected_at)
+            await self.question_turn.close(reason)
+            log(f"[presence] learner left ({reason}); lecturer is waiting")
+            return True
+
+    async def presence_watchdog(self) -> None:
+        """Persist attended seconds and stop speech on a half-open connection."""
+
+        while not self.closed:
+            await asyncio.sleep(PRESENCE_HEARTBEAT_S)
+            if not self.learner_present.is_set():
+                continue
+            silence = asyncio.get_running_loop().time() - self.last_presence_signal
+            if silence > PRESENCE_TIMEOUT_S:
+                await self.learner_departed("heartbeat_timeout")
+                continue
+            elapsed = self._consume_attended_seconds()
+            seen_at = await asyncio.to_thread(virtual_now)
+            await asyncio.to_thread(
+                self.progress.touch_presence,
+                elapsed,
+                seen_at,
+            )
+
+    async def _wait_for_learner(self, *, welcome: bool) -> bool:
+        if not self.learner_present.is_set():
+            await self.send({"type": "state", "state": "waiting"})
+        while not self.closed and not self.learner_present.is_set():
+            try:
+                await asyncio.wait_for(self.learner_present.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+        if self.closed:
+            return False
+        if welcome:
+            # Render (or load) before announcing the resume. On ordinary
+            # reconnects this clip was prepared after the first narration frame.
+            await self._prepare_prompt("rejoin")
+            await self.send({"type": "state", "state": "resuming"})
+            # Let the returning browser subscribe to the already-published track.
+            await asyncio.sleep(0.35)
+            if not await self._play_prompt("rejoin"):
+                return self.learner_present.is_set()
+            await self.send({"type": "state", "state": "lecturing"})
+        return True
 
     # -- the state machine ------------------------------------------------------
 
@@ -361,15 +510,36 @@ class LectureSession:
             for t_index, sentence in enumerate(split_sentences(segment["text"])):
                 script.append((s_index, t_index, segment["slide"], sentence))
 
+        # A token is only permission to enter; the participant must actually be
+        # present before the first attendance row or checkpoint is created.
+        if not await self._wait_for_learner(welcome=False):
+            return
+        checkpoint = await asyncio.to_thread(self.progress.initialise, len(script))
+        furthest_index = checkpoint.next_sentence_index
+        index = checkpoint.replay_from
+        if checkpoint.is_resume or self.previously_admitted:
+            if not await self._wait_for_learner(welcome=True):
+                return
+
         # Kokoro renders at ~1.6x realtime — too slow to start a sentence on demand,
         # but plenty fast to have the NEXT one ready while this one is playing. The
         # lecture text is known in advance, so we simply stay one sentence ahead.
-        index = 0
         upcoming: asyncio.Task[np.ndarray] | None = None
         current_slide = -1
 
         while index < len(script) and not self.closed:
+            if not self.learner_present.is_set():
+                if upcoming:
+                    upcoming.cancel()
+                    upcoming = None
+                index = replay_start(furthest_index, len(script))
+                current_slide = -1
+                if not await self._wait_for_learner(welcome=True):
+                    break
+
             s_index, t_index, slide, sentence = script[index]
+            position.segment = s_index
+            position.sentence = t_index
 
             if slide != current_slide:
                 await self.send({"type": "slide", "n": slide})
@@ -378,7 +548,7 @@ class LectureSession:
             try:
                 if upcoming:
                     audio = await upcoming
-                elif index == 0 and self.startup_trace:
+                elif not self._first_frame_recorded and self.startup_trace:
                     audio = await asyncio.wait_for(
                         self.sentence_audio(s_index, t_index, sentence),
                         timeout=self.startup_trace.remaining(),
@@ -390,11 +560,10 @@ class LectureSession:
                 return
             upcoming = None
 
-            if index == 0:
+            if not self._first_frame_recorded:
                 if not len(audio):
                     await self._startup_failed("first_audio_unavailable", "The lecturer's voice is unavailable. Please retry.")
                     return
-                # The first audio exists - NOW "speaking" is true.
                 await self.send({"type": "state", "state": "lecturing"})
 
             # Have the next sentence ready before speaking this one.
@@ -403,26 +572,49 @@ class LectureSession:
                 upcoming = asyncio.create_task(self.sentence_audio(next_s, next_t, next_text))
 
             finished = await self.play(audio)
-            if index == 0 and not self._first_frame_recorded:
+            if not finished:
+                if upcoming:
+                    upcoming.cancel()
+                    upcoming = None
+                if self.closed:
+                    break
+                # Repeats restore context but never advance persisted coverage.
+                index = replay_start(furthest_index, len(script))
+                current_slide = -1
+                continue
+            if not self._first_frame_recorded:
                 await self._startup_failed("first_frame_unavailable", "The lecture audio stream did not start. Please retry.")
                 return
-            if self.closed:
-                break
-            if finished:
-                index += 1
+
+            index += 1
+            if index > furthest_index:
+                furthest_index = index
+                await asyncio.to_thread(
+                    self.progress.record_sentence,
+                    furthest_index,
+                    len(script),
+                )
 
             # The student raised a hand: the sentence above was allowed to finish
             # (that is the whole point), and only now does the lecturer respond.
-            if self.hand_raised.is_set():
+            if self.hand_raised.is_set() and self.learner_present.is_set():
                 if upcoming:
                     upcoming.cancel()
                     upcoming = None
                 await self.handle_hand()
-                await self.send({"type": "state", "state": "lecturing"})
+                if self.learner_present.is_set():
+                    await self.send({"type": "state", "state": "lecturing"})
                 current_slide = -1      # re-announce the slide after the detour
 
-        position.segment = len(segments)
-        await self.send({"type": "state", "state": "ended"})
+        if furthest_index >= len(script) and not self.closed:
+            position.segment = len(segments)
+            elapsed = self._consume_attended_seconds()
+            self._attendance_tick = None
+            completed_at = await asyncio.to_thread(virtual_now)
+            await asyncio.to_thread(self.progress.complete, elapsed, completed_at)
+            await self.question_turn.close("lecture_completed")
+            await self.send({"type": "state", "state": "ended"})
+            self.learner_present.clear()
 
     async def _startup_failed(self, reason: str, detail: str) -> None:
         await self.send({"type": "progress", "stage": "problem", "detail": detail})
@@ -632,7 +824,7 @@ class LectureSession:
             result = await within_budget(
                 Stage.TOTAL,
                 answer_question(
-                    question, lecture_id=None, sid=self.lecture.sid, on_progress=on_progress,
+                    question, lecture_id=self.lecture.internal_id, sid=self.lecture.sid, on_progress=on_progress,
                     programme_id=scope.get("programme_id", ""),
                     course_id=scope.get("course_id", ""),
                     plan_version=scope.get("plan_version"),
@@ -683,13 +875,16 @@ class LectureSession:
                 else None
             )
             played = time.perf_counter()
-            await self.play(audio, interruptible=False)
+            delivered = await self.play(audio, interruptible=False)
             played = time.perf_counter() - played
             speech = len(audio) / self.sample_rate
             log(
                 f"[speak] sentence {index + 1}/{total}: waited {waited:.2f}s on TTS, "
                 f"{speech:.1f}s of speech played in {played:.2f}s"
             )
+            if not delivered:
+                await self.question_turn.close("learner_left")
+                return False
         await self.question_turn.close("completed")
         return True
 
@@ -1046,6 +1241,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         display_name = session_meta.display_name
         engine = ctx.proc.userdata.get("tts")
         if isinstance(display_name, str):
+            # Fixed templates only: metadata cannot inject arbitrary speech.
+            session.prompt_texts = render_templates(display_name)
             prompt_bank, cached_rate = ctx.proc.userdata["prompt_cache"].load(
                 learner_id=sid, display_name=display_name, language="en",
                 voice=str(getattr(engine, "voice", os.getenv("KOKORO_VOICE", "default"))),
@@ -1157,7 +1354,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             message = json.loads(packet.data.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return
-        if message.get("type") == "question":
+        if message.get("type") == "presence":
+            if message.get("state") == "present":
+                asyncio.create_task(session.learner_heartbeat())
+            elif message.get("state") == "leaving":
+                asyncio.create_task(session.learner_departed("client_leaving"))
+        elif message.get("type") == "question":
             confirmed = session.question_turn.confirm(str(message.get("text", "")))
             if confirmed is not None:
                 session.review_actions.put_nowait(("question", confirmed))
@@ -1206,17 +1408,20 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         session.interrupted.set()
         for task in tuple(listener_tasks.values()):
             task.cancel()
-        asyncio.create_task(session.question_turn.close("disconnect"))
+        asyncio.create_task(session.learner_departed("worker_disconnected"))
+
+    @ctx.room.on("participant_connected")
+    def on_participant_connected(participant: object) -> None:
+        if getattr(participant, "identity", None) == sid:
+            asyncio.create_task(session.learner_arrived())
 
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: object) -> None:
         if getattr(participant, "identity", None) != sid:
             return
-        session.closed = True
-        session.interrupted.set()
         for task in tuple(listener_tasks.values()):
             task.cancel()
-        asyncio.create_task(session.question_turn.close("learner_left"))
+        asyncio.create_task(session.learner_departed("participant_disconnected"))
 
     @ctx.room.on("reconnecting")
     def on_reconnecting(*_: object) -> None:
@@ -1225,6 +1430,11 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     @ctx.room.on("reconnected")
     def on_reconnected(*_: object) -> None:
         log("[live] room reconnected")
+        if any(
+            getattr(participant, "identity", None) == sid
+            for participant in getattr(ctx.room, "remote_participants", {}).values()
+        ):
+            asyncio.create_task(session.learner_arrived())
 
     # The learner can publish immediately after their browser connects while
     # this worker is still loading metadata. LiveKit does not replay an earlier
@@ -1238,7 +1448,20 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     ):
         start_listener(*existing)
 
-    await session.run()
+    if any(
+        getattr(participant, "identity", None) == sid
+        for participant in getattr(ctx.room, "remote_participants", {}).values()
+    ):
+        await session.learner_arrived()
+
+    watchdog = asyncio.create_task(session.presence_watchdog(), name="lecture-presence-watchdog")
+    try:
+        await session.run()
+    finally:
+        watchdog.cancel()
+        await asyncio.gather(watchdog, return_exceptions=True)
+        if session.learner_present.is_set():
+            await session.learner_departed("session_closed")
 
 
 async def _run_section(ctx: agents.JobContext, raw_meta: str, trace: StartupTrace) -> None:

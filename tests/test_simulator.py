@@ -34,6 +34,9 @@ class LiveSimulatorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_inbound({"type": "question", "text": ""})
         validate_inbound({"type": "retry"})
+        validate_inbound({"type": "presence", "state": "present"})
+        with self.assertRaises(ValueError):
+            validate_inbound({"type": "presence", "state": "missing"})
         validate_outbound({"type": "state", "state": "processing"})
         validate_outbound({"type": "speech", "state": "detected", "detail": "heard"})
         with self.assertRaises(ValueError):
