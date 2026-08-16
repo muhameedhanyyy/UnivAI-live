@@ -78,6 +78,7 @@ from microphone_tracks import (  # noqa: E402
     is_learner_microphone,
     track_key,
 )
+from room_presence import learner_is_in_room  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
@@ -208,8 +209,9 @@ class LectureSession:
         self.stt_problem: tuple[str, str] | None = None
         self.speaking = False
         self.closed = False          # the student left; stop talking to an empty room
-        # LiveKit participant events provide the fast path. Browser heartbeats
-        # cover half-open network connections where no disconnect event arrives.
+        # LiveKit's participant roster is authoritative. Browser heartbeats
+        # accelerate recovery, but timer throttling or a lossy packet must never
+        # mark a participant absent while LiveKit still sees them in the room.
         self.learner_present = asyncio.Event()
         self.presence_lock = asyncio.Lock()
         self.last_presence_signal = 0.0
@@ -455,8 +457,11 @@ class LectureSession:
                 continue
             silence = asyncio.get_running_loop().time() - self.last_presence_signal
             if silence > PRESENCE_TIMEOUT_S:
-                await self.learner_departed("heartbeat_timeout")
-                continue
+                if learner_is_in_room(self.room, self.lecture.sid):
+                    self.last_presence_signal = asyncio.get_running_loop().time()
+                else:
+                    await self.learner_departed("heartbeat_timeout")
+                    continue
             elapsed = self._consume_attended_seconds()
             seen_at = await asyncio.to_thread(virtual_now)
             await asyncio.to_thread(
@@ -1430,10 +1435,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     @ctx.room.on("reconnected")
     def on_reconnected(*_: object) -> None:
         log("[live] room reconnected")
-        if any(
-            getattr(participant, "identity", None) == sid
-            for participant in getattr(ctx.room, "remote_participants", {}).values()
-        ):
+        if learner_is_in_room(ctx.room, sid):
             asyncio.create_task(session.learner_arrived())
 
     # The learner can publish immediately after their browser connects while
@@ -1448,10 +1450,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     ):
         start_listener(*existing)
 
-    if any(
-        getattr(participant, "identity", None) == sid
-        for participant in getattr(ctx.room, "remote_participants", {}).values()
-    ):
+    if learner_is_in_room(ctx.room, sid):
         await session.learner_arrived()
 
     watchdog = asyncio.create_task(session.presence_watchdog(), name="lecture-presence-watchdog")
