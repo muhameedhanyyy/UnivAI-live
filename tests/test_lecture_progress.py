@@ -57,3 +57,27 @@ def test_actual_first_admission_fails_after_cutoff(monkeypatch):
     repository = LectureProgressRepository(lecture_id=1, learner_id="learner")
     with pytest.raises(LectureAdmissionClosed):
         repository.ensure_joined(datetime.now(timezone.utc))
+
+
+def test_first_admission_uses_the_confirmed_makeup_start_when_approved(monkeypatch):
+    captured = {}
+    common = ModuleType("common")
+    database = ModuleType("common.db")
+
+    def fetch_one(sql, params):
+        captured["sql"] = sql
+        captured["params"] = params
+        return {"first_admission": True}
+
+    database.fetch_one = fetch_one
+    monkeypatch.setitem(sys.modules, "common", common)
+    monkeypatch.setitem(sys.modules, "common.db", database)
+
+    joined_at = datetime.now(timezone.utc)
+    repository = LectureProgressRepository(lecture_id=7, learner_id="learner")
+    assert repository.ensure_joined(joined_at) is True
+
+    assert "item.remedy = 'makeup_live'" in captured["sql"]
+    assert "item.makeup_started_at IS NOT NULL" in captured["sql"]
+    assert "COALESCE(makeup.makeup_started_at, l.starts_at)" in captured["sql"]
+    assert captured["params"][:2] == (7, "learner")

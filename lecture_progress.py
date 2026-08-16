@@ -83,35 +83,62 @@ class LectureProgressRepository:
         from common.db import fetch_one
 
         admission = fetch_one(
-            """WITH inserted AS (
+            """WITH lecture_access AS (
+                 SELECT l.id,
+                        COALESCE(makeup.makeup_started_at, l.starts_at)
+                          AS effective_starts_at,
+                        CASE
+                          WHEN (la.script_payload->>'durationMinutes') ~ '^[0-9]+$'
+                           AND (la.script_payload->>'durationMinutes')::integer
+                               BETWEEN 45 AND 120
+                            THEN (la.script_payload->>'durationMinutes')::integer
+                          ELSE 60
+                        END AS duration_minutes
+                   FROM lectures l
+                   LEFT JOIN lecture_artifacts la
+                     ON la.artifact_id = l.lecture_artifact_id
+                   LEFT JOIN LATERAL (
+                     SELECT item.makeup_started_at
+                       FROM absence_case_items AS item
+                       JOIN absence_cases AS absence_case
+                         ON absence_case.id = item.case_id
+                        AND absence_case.student_id = item.student_id
+                      WHERE item.student_id = l.student_id
+                        AND item.lecture_public_id = l.public_id
+                        AND item.item_type = 'lecture'
+                        AND item.remedy = 'makeup_live'
+                        AND item.makeup_started_at IS NOT NULL
+                        AND absence_case.status = 'approved'
+                      ORDER BY absence_case.decided_at DESC NULLS LAST,
+                               item.created_at DESC
+                      LIMIT 1
+                   ) AS makeup ON TRUE
+                  WHERE l.id = %s AND l.student_id = %s
+              ), inserted AS (
                  INSERT INTO attendance
                      (student_id, lecture_id, joined_at, status, late_minutes)
-                SELECT %s, l.id, %s,
+                SELECT %s, lecture.id, %s,
                        CASE
-                         WHEN %s > l.starts_at + (%s * INTERVAL '1 minute')
+                         WHEN %s > lecture.effective_starts_at
+                                   + (%s * INTERVAL '1 minute')
                            THEN 'late'
                          ELSE 'on_time'
                        END,
                        CASE
-                         WHEN %s > l.starts_at + (%s * INTERVAL '1 minute')
+                         WHEN %s > lecture.effective_starts_at
+                                   + (%s * INTERVAL '1 minute')
                            THEN GREATEST(
                              0,
-                             FLOOR(EXTRACT(EPOCH FROM (%s - l.starts_at)) / 60)::integer
+                             FLOOR(EXTRACT(EPOCH FROM (
+                               %s - lecture.effective_starts_at
+                             )) / 60)::integer
                            )
                          ELSE 0
                        END
-                  FROM lectures l
-                  LEFT JOIN lecture_artifacts la
-                    ON la.artifact_id = l.lecture_artifact_id
-                 WHERE l.id = %s AND l.student_id = %s
-                   AND %s <= l.starts_at
-                     + ((CASE
-                           WHEN (la.script_payload->>'durationMinutes') ~ '^[0-9]+$'
-                            AND (la.script_payload->>'durationMinutes')::integer
-                                BETWEEN 45 AND 120
-                             THEN (la.script_payload->>'durationMinutes')::integer
-                           ELSE 60
-                         END)::double precision / 2 * INTERVAL '1 minute')
+                  FROM lecture_access AS lecture
+                 WHERE %s <= lecture.effective_starts_at
+                     + (lecture.duration_minutes::double precision / 2
+                        * INTERVAL '1 minute')
                 ON CONFLICT (student_id, lecture_id) DO NOTHING
                 RETURNING TRUE AS first_admission
               )
@@ -124,15 +151,15 @@ class LectureProgressRepository:
                  AND NOT EXISTS (SELECT 1 FROM inserted)
                LIMIT 1""",
             (
-                self.learner_id,
-                joined_at,
-                joined_at,
-                GRACE_MINUTES,
-                joined_at,
-                GRACE_MINUTES,
-                joined_at,
                 self.lecture_id,
                 self.learner_id,
+                self.learner_id,
+                joined_at,
+                joined_at,
+                GRACE_MINUTES,
+                joined_at,
+                GRACE_MINUTES,
+                joined_at,
                 joined_at,
                 self.lecture_id,
                 self.learner_id,
