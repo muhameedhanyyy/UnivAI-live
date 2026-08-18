@@ -74,6 +74,7 @@ from question_turn import QuestionTurnController, TurnState  # noqa: E402
 from resilience.fallbacks import choose_fallback  # noqa: E402
 from resilience.timeouts import Stage, StageTimeout, within_budget  # noqa: E402
 from audio_cache import AudioCache, script_digest  # noqa: E402
+from checkpoint_writer import CheckpointWriter  # noqa: E402
 from lecture_progress import (  # noqa: E402
     LectureAdmissionClosed,
     LectureProgressRepository,
@@ -544,85 +545,91 @@ class LectureSession:
         # lecture text is known in advance, so we simply stay one sentence ahead.
         upcoming: asyncio.Task[np.ndarray] | None = None
         current_slide = -1
+        checkpoint_writer = CheckpointWriter(
+            lambda checkpoint_index: self.progress.record_sentence(
+                checkpoint_index,
+                len(script),
+            ),
+            initial=furthest_index,
+        )
 
-        while index < len(script) and not self.closed:
-            if not self.learner_present.is_set():
-                if upcoming:
-                    upcoming.cancel()
-                    upcoming = None
-                index = replay_start(furthest_index, len(script))
-                current_slide = -1
-                if not await self._wait_for_learner(welcome=True):
-                    break
+        try:
+            while index < len(script) and not self.closed:
+                if not self.learner_present.is_set():
+                    if upcoming:
+                        upcoming.cancel()
+                        upcoming = None
+                    index = replay_start(furthest_index, len(script))
+                    current_slide = -1
+                    if not await self._wait_for_learner(welcome=True):
+                        break
 
-            s_index, t_index, slide, sentence = script[index]
-            position.segment = s_index
-            position.sentence = t_index
+                s_index, t_index, slide, sentence = script[index]
+                position.segment = s_index
+                position.sentence = t_index
 
-            if slide != current_slide:
-                await self.send({"type": "slide", "n": slide})
-                current_slide = slide
+                if slide != current_slide:
+                    await self.send({"type": "slide", "n": slide})
+                    current_slide = slide
 
-            try:
-                if upcoming:
-                    audio = await upcoming
-                elif not self._first_frame_recorded and self.startup_trace:
-                    audio = await asyncio.wait_for(
-                        self.sentence_audio(s_index, t_index, sentence),
-                        timeout=self.startup_trace.remaining(),
-                    )
-                else:
-                    audio = await self.sentence_audio(s_index, t_index, sentence)
-            except (asyncio.TimeoutError, TimeoutError):
-                await self._startup_failed("first_audio_timeout", "The lecturer could not start audio in time. Please retry.")
-                return
-            upcoming = None
-
-            if not self._first_frame_recorded:
-                if not len(audio):
-                    await self._startup_failed("first_audio_unavailable", "The lecturer's voice is unavailable. Please retry.")
+                try:
+                    if upcoming:
+                        audio = await upcoming
+                    elif not self._first_frame_recorded and self.startup_trace:
+                        audio = await asyncio.wait_for(
+                            self.sentence_audio(s_index, t_index, sentence),
+                            timeout=self.startup_trace.remaining(),
+                        )
+                    else:
+                        audio = await self.sentence_audio(s_index, t_index, sentence)
+                except (asyncio.TimeoutError, TimeoutError):
+                    await self._startup_failed("first_audio_timeout", "The lecturer could not start audio in time. Please retry.")
                     return
-                await self.send({"type": "state", "state": "lecturing"})
+                upcoming = None
 
-            # Have the next sentence ready before speaking this one.
-            if index + 1 < len(script):
-                next_s, next_t, _, next_text = script[index + 1]
-                upcoming = asyncio.create_task(self.sentence_audio(next_s, next_t, next_text))
-
-            finished = await self.play(audio)
-            if not finished:
-                if upcoming:
-                    upcoming.cancel()
-                    upcoming = None
-                if self.closed:
-                    break
-                # Repeats restore context but never advance persisted coverage.
-                index = replay_start(furthest_index, len(script))
-                current_slide = -1
-                continue
-            if not self._first_frame_recorded:
-                await self._startup_failed("first_frame_unavailable", "The lecture audio stream did not start. Please retry.")
-                return
-
-            index += 1
-            if index > furthest_index:
-                furthest_index = index
-                await asyncio.to_thread(
-                    self.progress.record_sentence,
-                    furthest_index,
-                    len(script),
-                )
-
-            # The student raised a hand: the sentence above was allowed to finish
-            # (that is the whole point), and only now does the lecturer respond.
-            if self.hand_raised.is_set() and self.learner_present.is_set():
-                if upcoming:
-                    upcoming.cancel()
-                    upcoming = None
-                await self.handle_hand()
-                if self.learner_present.is_set():
+                if not self._first_frame_recorded:
+                    if not len(audio):
+                        await self._startup_failed("first_audio_unavailable", "The lecturer's voice is unavailable. Please retry.")
+                        return
                     await self.send({"type": "state", "state": "lecturing"})
-                current_slide = -1      # re-announce the slide after the detour
+
+                # Have the next sentence ready before speaking this one.
+                if index + 1 < len(script):
+                    next_s, next_t, _, next_text = script[index + 1]
+                    upcoming = asyncio.create_task(self.sentence_audio(next_s, next_t, next_text))
+
+                finished = await self.play(audio)
+                if not finished:
+                    if upcoming:
+                        upcoming.cancel()
+                        upcoming = None
+                    if self.closed:
+                        break
+                    # Repeats restore context but never advance persisted coverage.
+                    index = replay_start(furthest_index, len(script))
+                    current_slide = -1
+                    continue
+                if not self._first_frame_recorded:
+                    await self._startup_failed("first_frame_unavailable", "The lecture audio stream did not start. Please retry.")
+                    return
+
+                index += 1
+                if index > furthest_index:
+                    furthest_index = index
+                    checkpoint_writer.record(furthest_index)
+
+                # The student raised a hand: the sentence above was allowed to finish
+                # (that is the whole point), and only now does the lecturer respond.
+                if self.hand_raised.is_set() and self.learner_present.is_set():
+                    if upcoming:
+                        upcoming.cancel()
+                        upcoming = None
+                    await self.handle_hand()
+                    if self.learner_present.is_set():
+                        await self.send({"type": "state", "state": "lecturing"})
+                    current_slide = -1      # re-announce the slide after the detour
+        finally:
+            await checkpoint_writer.flush()
 
         if furthest_index >= len(script) and not self.closed:
             position.segment = len(segments)
@@ -1498,10 +1505,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             asyncio.create_task(cancel_review())
         elif message.get("type") == "raise_hand":
             if session.question_turn.state not in {TurnState.IDLE, TurnState.CLOSED}:
-                session.question_turn.start()
                 return
             log("[lecture] hand raised")
             session.hand_raised.set()
+            asyncio.create_task(session.send({"type": "hand", "state": "raised"}))
         elif message.get("type") == "mic":
             if message.get("muted"):
                 mark_microphone_muted()
