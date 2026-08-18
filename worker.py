@@ -12,7 +12,7 @@ State machine (exactly as specified):
     INTERRUPTED  stop TTS immediately, remember the position (segment + sentence)
                  run STT until the student stops (silence ~800 ms) -> ANSWERING
 
-    ANSWERING    question -> RAG (MCP) -> tiny LLM -> <=3 sentences, cited
+    ANSWERING    contextual question -> RAG (MCP) -> LLM -> <=4 sentences, cited
                  speak the answer, then resume LECTURING from the remembered
                  sentence, restarting that sentence from its beginning.
 
@@ -59,6 +59,13 @@ from common.clock import now as virtual_now  # noqa: E402
 from common.sentences import split_sentences  # noqa: E402
 from protocols.lecture_session import LectureSessionMeta, SessionMetadataError  # noqa: E402
 from qa import TROUBLE, answer_question  # noqa: E402
+from qa_context import ConversationMemory  # noqa: E402
+from credits import (  # noqa: E402
+    CreditReservationError,
+    release_reservation,
+    settle_reservation,
+    validate_raise_hand_reservation,
+)
 from tts import load_live_engine  # noqa: E402
 from prompt_cache import PromptCache  # noqa: E402
 from startup import LazyDependencies, StartupStage, StartupTrace  # noqa: E402
@@ -202,8 +209,14 @@ class LectureSession:
         self.heard: asyncio.Queue[str] = asyncio.Queue()
         # Review actions are explicit so retry/cancel cannot be mistaken for a
         # learner's question or leak into the next turn.
-        self.review_actions: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        self.review_actions: asyncio.Queue[
+            tuple[str, str, str | None, str | None]
+        ] = asyncio.Queue()
         self.question_turn = QuestionTurnController()
+        # One bounded chat chain per learner room. It resolves conversational
+        # follow-ups against the visible slide and earlier raised-hand turns;
+        # qa.py still requires fresh textbook evidence for every factual answer.
+        self.conversation = ConversationMemory(lecture.segments)
         self.question_finalize_lock = asyncio.Lock()
         self.flush_capture = None
         self.stt_problem: tuple[str, str] | None = None
@@ -788,7 +801,7 @@ class LectureSession:
             log(f"[question-turn] stage=review turn_id={self.question_turn.turn_id}")
 
             try:
-                action, value = await asyncio.wait_for(
+                action, value, credit_reservation_id, credit_user_id = await asyncio.wait_for(
                     self.review_actions.get(),
                     timeout=REVIEW_TIMEOUT_S,
                 )
@@ -809,6 +822,14 @@ class LectureSession:
             question = value
             break
 
+        if not credit_reservation_id or not credit_user_id:
+            await self.send({
+                "type": "speech",
+                "state": "error",
+                "detail": "The 2-Credit reservation could not be verified. Your Credits were not charged.",
+            })
+            return False
+
         # The question is in — the capture window's job is done. Closing it now
         # keeps the student's still-open mic (or its echo of OUR answer) from
         # feeding Whisper while the lecturer talks.
@@ -825,6 +846,7 @@ class LectureSession:
         # scope. Falls back to empty strings when session_meta was not available
         # (only possible in standalone mode where worker.py is not used).
         scope = self.session_meta.as_citation_scope() if self.session_meta else {}
+        question_context = self.conversation.context_at(self.lecture.position.segment)
         try:
             result = await within_budget(
                 Stage.TOTAL,
@@ -834,22 +856,76 @@ class LectureSession:
                     course_id=scope.get("course_id", ""),
                     plan_version=scope.get("plan_version"),
                     lecture_id_str=scope.get("lecture_id", ""),
+                    context=question_context,
+                    credit_reservation_id=credit_reservation_id,
                 ),
             )
         except StageTimeout:
             fallback = choose_fallback("agent", "total_qa_timeout")
             await self.send(fallback.event())
-            result = {"answer": TROUBLE, "pages": [], "citations": []}
+            result = {"status": "failed", "answer": TROUBLE, "pages": [], "citations": []}
+
+        try:
+            if result.get("status") == "answered" and result.get("citations"):
+                await asyncio.to_thread(
+                    settle_reservation,
+                    credit_user_id,
+                    credit_reservation_id,
+                )
+                await self.send({
+                    "type": "credit",
+                    "state": "settled",
+                    "amount": 2,
+                    "reservation_id": credit_reservation_id,
+                })
+            else:
+                await asyncio.to_thread(
+                    release_reservation,
+                    credit_user_id,
+                    credit_reservation_id,
+                )
+                await self.send({
+                    "type": "credit",
+                    "state": "released",
+                    "amount": 2,
+                    "reservation_id": credit_reservation_id,
+                })
+        except CreditReservationError as exc:
+            log(f"[credits] reservation transition failed: {exc}")
+            result = {
+                "status": "failed",
+                "answer": TROUBLE,
+                "pages": [],
+                "citations": [],
+            }
+            await self.send({
+                "type": "speech",
+                "state": "error",
+                "detail": "The answer could not be delivered because its Credit reservation expired. No Credits were charged.",
+            })
         await self.send({"type": "progress", "stage": "speaking", "detail": ""})
+
+        slide_number = (
+            question_context.current_slide.number
+            if question_context.current_slide
+            else None
+        )
+        self.conversation.record(
+            question,
+            result["answer"],
+            slide_number=slide_number,
+        )
 
         await self.send(
             {
                 "type": "answer",
                 "payload": {
+                    "turn_id": self.question_turn.turn_id,
                     "question": question,
                     "answer": result["answer"],
                     "pages": result["pages"],
                     "citations": result.get("citations", []),
+                    "slide": slide_number,
                 },
             }
         )
@@ -926,7 +1002,6 @@ async def listen(session: LectureSession, track: rtc.RemoteAudioTrack, model, va
             def run_stt() -> str:
                 segments, _info = resolved_model.transcribe(
                     audio,
-                    language="en",
                     vad_filter=False,
                     condition_on_previous_text=False,
                 )
@@ -1365,12 +1440,51 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             elif message.get("state") == "leaving":
                 asyncio.create_task(session.learner_departed("client_leaving"))
         elif message.get("type") == "question":
-            confirmed = session.question_turn.confirm(str(message.get("text", "")))
-            if confirmed is not None:
-                session.review_actions.put_nowait(("question", confirmed))
+            async def confirm_paid_question() -> None:
+                reservation_id = str(message.get("credit_reservation_id", ""))
+                lecture_public_id = (
+                    session.session_meta.lecture_id if session.session_meta else ""
+                )
+                try:
+                    reservation = await asyncio.to_thread(
+                        validate_raise_hand_reservation,
+                        reservation_id,
+                        session.lecture.sid,
+                        lecture_public_id,
+                    )
+                except CreditReservationError as exc:
+                    await session.send({
+                        "type": "speech",
+                        "state": "error",
+                        "detail": str(exc),
+                    })
+                    return
+                confirmed = session.question_turn.confirm(str(message.get("text", "")))
+                if confirmed is not None:
+                    session.review_actions.put_nowait(
+                        (
+                            "question",
+                            confirmed,
+                            reservation_id,
+                            str(reservation["user_id"]),
+                        )
+                    )
+                else:
+                    # The browser retried after the review window changed. Do
+                    # not leave its balance held until the TTL expires.
+                    try:
+                        await asyncio.to_thread(
+                            release_reservation,
+                            str(reservation["user_id"]),
+                            reservation_id,
+                        )
+                    except CreditReservationError as exc:
+                        log(f"[credits] stale question release failed: {exc}")
+
+            asyncio.create_task(confirm_paid_question())
         elif message.get("type") == "retry":
             if session.question_turn.state is TurnState.REVIEW:
-                session.review_actions.put_nowait(("retry", ""))
+                session.review_actions.put_nowait(("retry", "", None, None))
         elif message.get("type") == "cancel":
             async def cancel_review() -> None:
                 state = session.question_turn.state
@@ -1380,7 +1494,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                     return
                 if await session.question_turn.cancel():
                     if state is TurnState.REVIEW:
-                        session.review_actions.put_nowait(("cancel", ""))
+                        session.review_actions.put_nowait(("cancel", "", None, None))
             asyncio.create_task(cancel_review())
         elif message.get("type") == "raise_hand":
             if session.question_turn.state not in {TurnState.IDLE, TurnState.CLOSED}:

@@ -2,6 +2,7 @@
 
 These tests verify:
 - Grounded answers produce citations and pages.
+- Contextual follow-ups enrich retrieval and the answer prompt with prior turns.
 - Out-of-scope questions return explicit refusal (pages=[]).
 - RagUnavailable produces TROUBLE fallback without raising.
 - LLMError produces TROUBLE fallback without raising.
@@ -78,6 +79,7 @@ sys.modules["common.sentences"] = MagicMock(split_sentences=lambda t: [t])
 # failures; this suite must never silently skip the production Q&A module.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import qa as _qa_module  # noqa: E402
+from qa_context import ConversationTurn, QuestionContext, SlideSnapshot  # noqa: E402
 
 _SCOPE = {
     "programme_id": "prog-test",
@@ -138,6 +140,44 @@ class TestAnswerQuestionMocked(unittest.TestCase):
             )
         self.assertIn("page 2", result["answer"])
         self.assertIn("tenant-guide.pdf", result["answer"])
+
+    def test_contextual_follow_up_reaches_retrieval_and_answer_prompt(self) -> None:
+        search = AsyncMock(return_value=[_RAG_HIT_PAGE_2])
+        complete = MagicMock(
+            return_value=_LLMResult("Tenant filtering keeps material separate.")
+        )
+        context = QuestionContext(
+            current_slide=SlideSnapshot(
+                3,
+                "Tenant filters keep one learner's material separate.",
+            ),
+            history=(
+                ConversationTurn(
+                    "I did not understand the current slide.",
+                    "The filter selects only your material.",
+                    slide_number=3,
+                ),
+            ),
+        )
+        with (
+            patch.object(_qa_module, "search_book", search),
+            patch.object(_qa_module, "complete", complete),
+            patch.object(_qa_module, "_log_later", MagicMock()),
+        ):
+            self._run(
+                _qa_module.answer_question(
+                    "Please explain it again.",
+                    lecture_id=None,
+                    context=context,
+                )
+            )
+
+        retrieval_query = search.await_args.args[0]
+        answer_prompt = complete.call_args.args[0]
+        self.assertIn("Immediately preceding student question", retrieval_query)
+        self.assertIn("The filter selects only your material", retrieval_query)
+        self.assertIn("Resolved turn type: follow_up", answer_prompt)
+        self.assertIn("Textbook evidence", answer_prompt)
 
     def test_out_of_scope_question_returns_refusal(self) -> None:
         """A question the book doesn't cover: RAG returns empty hits."""

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -48,6 +49,13 @@ PIPER_MODEL = os.getenv("PIPER_MODEL", "UnivAI-live/models/piper/en_US-lessac-me
 KOKORO_MODEL = os.getenv("KOKORO_MODEL", "UnivAI-live/models/kokoro/kokoro-v1.0.onnx")
 KOKORO_VOICES = os.getenv("KOKORO_VOICES", "UnivAI-live/models/kokoro/voices-v1.0.bin")
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
+
+_ARABIC_TEXT = re.compile(r"[\u0600-\u06ff]")
+
+
+def language_for_text(text: str) -> str:
+    """Return the authored language used by the multilingual speech engine."""
+    return "ar" if _ARABIC_TEXT.search(text) else "en"
 
 
 def _resolve(relative: str) -> Path:
@@ -123,10 +131,11 @@ class CoquiTTS(TTSEngine):
         ).to(device())
         print(f"[tts] XTTS-v2 loaded on {describe()}")
         self.speaker = os.getenv("TTS_SPEAKER", "Ana Florence")
-        self.language = os.getenv("TTS_LANGUAGE", "en")
+        self.language = os.getenv("TTS_LANGUAGE", "auto").strip().lower()
 
     def render(self, text: str) -> np.ndarray:
-        wav = self.model.tts(text=text, speaker=self.speaker, language=self.language)
+        language = language_for_text(text) if self.language == "auto" else self.language
+        wav = self.model.tts(text=text, speaker=self.speaker, language=language)
         return np.asarray(wav, dtype=np.float32)
 
 
