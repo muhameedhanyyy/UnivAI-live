@@ -59,7 +59,7 @@ from common.clock import now as virtual_now  # noqa: E402
 from common.sentences import split_sentences  # noqa: E402
 from protocols.lecture_session import LectureSessionMeta, SessionMetadataError  # noqa: E402
 from qa import TROUBLE, answer_question  # noqa: E402
-from qa_context import ConversationMemory  # noqa: E402
+from qa_context import ConversationMemory, resolve_slide_reference  # noqa: E402
 from credits import (  # noqa: E402
     CreditReservationError,
     release_reservation,
@@ -109,6 +109,7 @@ PROMPT_TEXTS = {
     "ask": "Yes? Do you have a question? Unmute your microphone and go ahead.",
     "remind": "Your hand is still raised. Unmute whenever you are ready; I am listening.",
     "resume": "No question? No problem. Alright everyone, eyes back on the slides, and let us continue!",
+    "answer_resume": "I hope that clears it up. Now, let us return to where we left off.",
     "rejoin": "Welcome back. I am continuing from three sentences before where we stopped.",
 }
 
@@ -718,6 +719,11 @@ class LectureSession:
         if not answered and self.question_turn.state is not TurnState.CLOSED:
             await self.question_turn.close("no_speech" if unmuted else "unmute_timeout")
 
+        if answered:
+            # A short spoken bridge makes the boundary between the learner's
+            # answer and resumed narration unmistakable without adding silence.
+            await self._play_prompt("answer_resume")
+
         await self.send(hand_event("lowered", request_id))
         self.hand_request_id = None
         if not answered:
@@ -923,15 +929,21 @@ class LectureSession:
             })
         await self.send({"type": "progress", "stage": "speaking", "detail": ""})
 
-        slide_number = (
+        original_slide_number = (
             question_context.current_slide.number
             if question_context.current_slide
             else None
         )
+        referenced_slide_number = resolve_slide_reference(
+            question,
+            question_context,
+            (segment.get("slide") for segment in self.lecture.segments),
+        )
+        answer_slide_number = referenced_slide_number or original_slide_number
         self.conversation.record(
             question,
             result["answer"],
-            slide_number=slide_number,
+            slide_number=answer_slide_number,
         )
 
         await self.send(
@@ -943,7 +955,7 @@ class LectureSession:
                     "answer": result["answer"],
                     "pages": result["pages"],
                     "citations": result.get("citations", []),
-                    "slide": slide_number,
+                    "slide": answer_slide_number,
                 },
             }
         )
@@ -951,39 +963,51 @@ class LectureSession:
         # The answer itself is not interruptible: it is short by design. Render
         # the NEXT sentence while the current one plays — the silent render gap
         # between sentences was why "Speaking" felt like it never finished.
-        sentences = split_sentences(result["answer"])
-        total = len(sentences)
-        log(f"[speak] answer has {total} sentences, {len(result['answer'])} chars")
-        upcoming: asyncio.Task[np.ndarray] | None = (
-            asyncio.create_task(self.render(sentences[0])) if sentences else None
+        changed_slide = (
+            answer_slide_number is not None
+            and original_slide_number is not None
+            and answer_slide_number != original_slide_number
         )
-        for index in range(total):
-            await self.send(
-                {
-                    "type": "progress",
-                    "stage": "speaking",
-                    "detail": f"sentence {index + 1} of {total}",
-                }
+        if changed_slide:
+            await self.send({"type": "slide", "n": answer_slide_number})
+
+        try:
+            sentences = split_sentences(result["answer"])
+            total = len(sentences)
+            log(f"[speak] answer has {total} sentences, {len(result['answer'])} chars")
+            upcoming: asyncio.Task[np.ndarray] | None = (
+                asyncio.create_task(self.render(sentences[0])) if sentences else None
             )
-            waited = time.perf_counter()
-            audio = await upcoming if upcoming else await self.render(sentences[index])
-            waited = time.perf_counter() - waited
-            upcoming = (
-                asyncio.create_task(self.render(sentences[index + 1]))
-                if index + 1 < total
-                else None
-            )
-            played = time.perf_counter()
-            delivered = await self.play(audio, interruptible=False)
-            played = time.perf_counter() - played
-            speech = len(audio) / self.sample_rate
-            log(
-                f"[speak] sentence {index + 1}/{total}: waited {waited:.2f}s on TTS, "
-                f"{speech:.1f}s of speech played in {played:.2f}s"
-            )
-            if not delivered:
-                await self.question_turn.close("learner_left")
-                return False
+            for index in range(total):
+                await self.send(
+                    {
+                        "type": "progress",
+                        "stage": "speaking",
+                        "detail": f"sentence {index + 1} of {total}",
+                    }
+                )
+                waited = time.perf_counter()
+                audio = await upcoming if upcoming else await self.render(sentences[index])
+                waited = time.perf_counter() - waited
+                upcoming = (
+                    asyncio.create_task(self.render(sentences[index + 1]))
+                    if index + 1 < total
+                    else None
+                )
+                played = time.perf_counter()
+                delivered = await self.play(audio, interruptible=False)
+                played = time.perf_counter() - played
+                speech = len(audio) / self.sample_rate
+                log(
+                    f"[speak] sentence {index + 1}/{total}: waited {waited:.2f}s on TTS, "
+                    f"{speech:.1f}s of speech played in {played:.2f}s"
+                )
+                if not delivered:
+                    await self.question_turn.close("learner_left")
+                    return False
+        finally:
+            if changed_slide:
+                await self.send({"type": "slide", "n": original_slide_number})
         await self.question_turn.close("completed")
         return True
 

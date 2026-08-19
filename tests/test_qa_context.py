@@ -11,6 +11,7 @@ from qa_context import (
     build_answer_prompt,
     build_retrieval_query,
     classify_question,
+    resolve_slide_reference,
 )
 
 
@@ -107,3 +108,21 @@ def test_memory_is_bounded_to_recent_turns():
     memory.record("third", "three", slide_number=3)
 
     assert [turn.question for turn in memory.turns] == ["second", "third"]
+
+
+def test_explicit_slide_reference_resolves_only_existing_slides():
+    context = ConversationMemory(SEGMENTS).context_at(3)
+
+    assert resolve_slide_reference("Can you explain slide 1?", context, [1, 2, 3]) == 1
+    assert resolve_slide_reference("اشرح السلايد رقم ٢", context, [1, 2, 3]) == 2
+    assert resolve_slide_reference("What is on slide 99?", context, [1, 2, 3]) is None
+
+
+def test_relative_and_follow_up_slide_references_resolve_deterministically():
+    memory = ConversationMemory(SEGMENTS)
+    memory.record("Explain slide 2", "A hash maps a key to a bucket.", slide_number=2)
+    context = memory.context_at(3)
+
+    assert resolve_slide_reference("Show the previous slide", context, [1, 2, 3]) == 2
+    assert resolve_slide_reference("Explain it again", context, [1, 2, 3]) == 2
+    assert resolve_slide_reference("Show the next slide", context, [1, 2, 3]) is None

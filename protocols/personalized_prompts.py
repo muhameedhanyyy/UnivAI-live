@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 
 MANIFEST_SCHEMA = "univai.live.personalized-prompts"
 MANIFEST_VERSION = "1.0.0"
-PHRASE_SET_VERSION = "1.1.0"
+PHRASE_SET_VERSION = "1.2.0"
 
 
 @dataclass(frozen=True)

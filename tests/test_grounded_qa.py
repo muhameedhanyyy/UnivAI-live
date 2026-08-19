@@ -284,9 +284,11 @@ class TestAnswerQuestionMocked(unittest.TestCase):
 
     def test_on_progress_called_at_each_stage(self) -> None:
         stages: list[str] = []
+        details: list[str] = []
 
         async def capture(stage: str, detail: str = "") -> None:
             stages.append(stage)
+            details.append(detail)
 
         with (
             patch.object(_qa_module, "search_book", AsyncMock(return_value=[_RAG_HIT_PAGE_2])),
@@ -301,6 +303,7 @@ class TestAnswerQuestionMocked(unittest.TestCase):
         self.assertIn("retrieving", stages)
         self.assertIn("retrieved", stages)
         self.assertIn("answered", stages)
+        self.assertTrue(all("stub-model" not in detail for detail in details))
 
     # -- session identity forwarding ------------------------------------------
 

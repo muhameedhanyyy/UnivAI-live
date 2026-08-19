@@ -124,6 +124,17 @@ _CURRENT_SLIDE = re.compile(
     r"(?:الشريحة|السلايد)\s+(?:الحالية|الحالي|دي|ده)",
     re.IGNORECASE,
 )
+_NEXT_SLIDE = re.compile(
+    r"\b(?:next|following)\s+(?:slide|page)\b|"
+    r"\b(?:slide|page)\s+(?:after|ahead)\b|"
+    r"(?:الشريحة|السلايد|الصفحة)\s+(?:التالية|التالي|الجاية|اللي\s+بعدها)",
+    re.IGNORECASE,
+)
+_NUMBERED_SLIDE = re.compile(
+    r"(?:\b(?:slide|page)\b|(?:الشريحة|السلايد|الصفحة))\s*"
+    r"(?:(?:number|no\.?|رقم)\s*)?#?\s*(\d{1,4})\b",
+    re.IGNORECASE,
+)
 _FOLLOW_UP = re.compile(
     r"\b(?:again|it|that|those|them|same|simpler|differently|more|"
     r"didn['’]?t\s+understand|did\s+not\s+understand|don['’]?t\s+get|"
@@ -170,6 +181,51 @@ def classify_question(question: str, context: QuestionContext) -> QuestionIntent
     if _CURRENT_CONFUSION.search(normalized):
         return QuestionIntent.CURRENT_SLIDE
     return QuestionIntent.STANDALONE
+
+
+def resolve_slide_reference(
+    question: str,
+    context: QuestionContext,
+    available_slides: Iterable[int],
+) -> int | None:
+    """Resolve a slide the learner explicitly or conversationally refers to.
+
+    Only slide numbers that exist in the lecture are returned. A missing or
+    ambiguous reference therefore leaves the presentation exactly where it is.
+    """
+
+    ordered = tuple(dict.fromkeys(
+        slide for slide in available_slides if isinstance(slide, int) and slide > 0
+    ))
+    if not ordered:
+        return None
+    allowed = set(ordered)
+    normalized = _compact(question)
+
+    numbered = _NUMBERED_SLIDE.search(normalized)
+    if numbered:
+        requested = int(numbered.group(1))
+        return requested if requested in allowed else None
+
+    if _PREVIOUS_SLIDE.search(normalized):
+        previous = context.previous_slide.number if context.previous_slide else None
+        return previous if previous in allowed else None
+
+    current = context.current_slide.number if context.current_slide else None
+    if _NEXT_SLIDE.search(normalized) and current in allowed:
+        current_index = ordered.index(current)
+        return ordered[current_index + 1] if current_index + 1 < len(ordered) else None
+
+    if _CURRENT_SLIDE.search(normalized) or _CURRENT_CONFUSION.search(normalized):
+        return current if current in allowed else None
+
+    if context.history and (
+        _FOLLOW_UP.search(normalized) or _BARE_FOLLOW_UP.fullmatch(normalized)
+    ):
+        prior = context.history[-1].slide_number
+        return prior if prior in allowed else None
+
+    return None
 
 
 def build_retrieval_query(question: str, context: QuestionContext) -> str:
@@ -354,4 +410,5 @@ __all__ = [
     "classify_question",
     "context_from_dict",
     "context_to_dict",
+    "resolve_slide_reference",
 ]

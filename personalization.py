@@ -10,6 +10,7 @@ PHRASES = {
     "ask": "Yes, {name}? Do you have a question? Unmute your microphone and go ahead.",
     "remind": "{name}, your hand is still raised. Unmute whenever you are ready; I am listening.",
     "resume": "No question? No problem. Let us continue with the lecture.",
+    "answer_resume": "I hope that clears it up. Now, let us return to where we left off.",
     "rejoin": "Welcome back, {name}. I am continuing from three sentences before where we stopped.",
 }
 
