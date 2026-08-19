@@ -87,6 +87,7 @@ from microphone_tracks import (  # noqa: E402
     track_key,
 )
 from room_presence import learner_is_in_room  # noqa: E402
+from hand_protocol import hand_event, normalize_hand_request_id  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
@@ -202,6 +203,7 @@ class LectureSession:
         self.interrupted = asyncio.Event()   # legacy stop signal (room closing)
         # The raise-hand protocol: the student asks permission BEFORE unmuting.
         self.hand_raised = asyncio.Event()
+        self.hand_request_id: str | None = None
         self.mic_unmuted = asyncio.Event()
         self.hand_active = False             # capture window: only now does the Listener record
         self.prompts: dict[str, np.ndarray] = {}
@@ -454,6 +456,7 @@ class LectureSession:
             self._attendance_tick = None
             self.learner_present.clear()
             self.hand_raised.clear()
+            self.hand_request_id = None
             self.hand_active = False
             self.mic_unmuted.clear()
             disconnected_at = await asyncio.to_thread(virtual_now)
@@ -679,12 +682,19 @@ class LectureSession:
         the hand and pull the class back with the resume line.
         """
         self.hand_raised.clear()
+        request_id = self.hand_request_id
         if self.question_turn.start() is None:
+            await self.send(hand_event(
+                "rejected",
+                request_id,
+                detail="Finish the current question before raising your hand again.",
+            ))
+            self.hand_request_id = None
             return
 
         await self.send({"type": "state", "state": "asking"})
         await self._play_prompt("ask")
-        await self.send({"type": "hand", "state": "acked"})
+        await self.send(hand_event("acked", request_id))
 
         unmuted = await self._wait_for_unmute(4.0)
         if not unmuted and self.question_turn.state is not TurnState.CLOSED:
@@ -708,7 +718,8 @@ class LectureSession:
         if not answered and self.question_turn.state is not TurnState.CLOSED:
             await self.question_turn.close("no_speech" if unmuted else "unmute_timeout")
 
-        await self.send({"type": "hand", "state": "lowered"})
+        await self.send(hand_event("lowered", request_id))
+        self.hand_request_id = None
         if not answered:
             # No question came. Lower the hand and catch the room's attention.
             await self._play_prompt("resume")
@@ -1496,19 +1507,31 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             async def cancel_review() -> None:
                 state = session.question_turn.state
                 if state is TurnState.IDLE and session.hand_raised.is_set():
+                    request_id = session.hand_request_id
                     session.hand_raised.clear()
-                    await session.send({"type": "hand", "state": "lowered"})
+                    session.hand_request_id = None
+                    await session.send(hand_event("lowered", request_id))
                     return
                 if await session.question_turn.cancel():
                     if state is TurnState.REVIEW:
                         session.review_actions.put_nowait(("cancel", "", None, None))
             asyncio.create_task(cancel_review())
         elif message.get("type") == "raise_hand":
-            if session.question_turn.state not in {TurnState.IDLE, TurnState.CLOSED}:
+            request_id = normalize_hand_request_id(message.get("request_id"))
+            if (
+                session.hand_raised.is_set()
+                or session.question_turn.state not in {TurnState.IDLE, TurnState.CLOSED}
+            ):
+                asyncio.create_task(session.send(hand_event(
+                    "rejected",
+                    request_id,
+                    detail="Finish the current question before raising your hand again.",
+                )))
                 return
-            log("[lecture] hand raised")
+            session.hand_request_id = request_id
+            log(f"[lecture] hand raised (request_id={request_id or 'legacy'})")
             session.hand_raised.set()
-            asyncio.create_task(session.send({"type": "hand", "state": "raised"}))
+            asyncio.create_task(session.send(hand_event("raised", request_id)))
         elif message.get("type") == "mic":
             if message.get("muted"):
                 mark_microphone_muted()
